@@ -18,9 +18,10 @@ VMLINUZ="$P/boot/vmlinuz-$KVER"
 echo "[*] Kernel: $KVER"
 echo "[*] Wallpaper: $WALL_SRC"
 
-echo "[1/6] Font + wallpaper"
+echo "[1/6] Font + wallpaper + icon"
 python3 "$SRC/mkfont.py" "$BUILD/font.h"
 python3 "$SRC/mkwallpaper.py" "$WALL_SRC" "$BUILD/wallpaper.raw"
+python3 "$SRC/mkicon.py" "$ROOT/assets/terminal-icon.png" "$BUILD/terminal_icon.h"
 
 echo "[2/6] splash (static)"
 gcc -O2 -std=gnu11 -static -I"$BUILD" -o "$BUILD/splash" "$SRC/splash.c" -lm
@@ -34,13 +35,20 @@ cp "$P/usr/bin/busybox" "$RM/bin/busybox"
 cp "$BUILD/splash" "$RM/usr/bin/splash"
 cp "$BUILD/wallpaper.raw" "$RM/usr/share/splash/wallpaper.raw"
 
-# PS/2 mouse driver (busybox insmod cannot read .xz, so unpack it here)
+# PS/2 mouse driver + input event device (busybox insmod cannot read .xz,
+# so unpack both here; evdev provides /dev/input/event* for the keyboard)
 mkdir -p "$RM/lib/modules"
 KMOD="$P/usr/lib/modules/$KVER/kernel/drivers/input/mouse/psmouse.ko.xz"
 if [ -f "$KMOD" ]; then
     unxz -c "$KMOD" > "$RM/lib/modules/psmouse.ko"
 else
     echo "WARN: psmouse.ko.xz not found - mouse will not work"
+fi
+KMOD2="$P/usr/lib/modules/$KVER/kernel/drivers/input/evdev.ko.xz"
+if [ -f "$KMOD2" ]; then
+    unxz -c "$KMOD2" > "$RM/lib/modules/evdev.ko"
+else
+    echo "WARN: evdev.ko.xz not found - keyboard will not work"
 fi
 install -m 0755 "$SRC/init" "$RM/init"
 ( cd "$RM" && find . -print0 | cpio --null -o -H newc --quiet | gzip -9 > "$BUILD/initrd.gz" )
@@ -72,7 +80,7 @@ set default=0
 set timeout=1
 set timeout_style=hidden
 insmod all_video
-set gfxmode=1024x768x32,1024x768x24,800x600x32,800x600x24,auto
+set gfxmode=1920x1080x32,1600x900x32,1280x720x32,1024x768x32,auto
 set gfxpayload=keep
 insmod gfxterm
 terminal_output gfxterm

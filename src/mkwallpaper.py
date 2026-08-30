@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""AquaOS: convert the wallpaper image into a raw RGB file (1024x768)."""
+"""AquaOS: convert the wallpaper image into a raw RGB file (1920x1080)."""
 import sys
 from PIL import Image
 
-WALL_W, WALL_H = 1024, 768
+WALL_W, WALL_H = 1920, 1080
 
 
 def main():

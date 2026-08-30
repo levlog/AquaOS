@@ -1,20 +1,23 @@
 /*
- * AquaOS boot splash / desktop shell.
+ * AquaOS boot splash / desktop shell (v4).
  *
  * Renders directly on the Linux framebuffer (/dev/fb0):
- *   - bottom-left: live kernel log lines, read from /dev/kmsg (real data only)
- *   - center:      small white arc spinner, macOS-style
- *   - when init signals /run/bootdone: smooth crossfade to the desktop
- *   - desktop:     wallpaper + empty macOS-style dock (frosted dark glass)
- *   - top:         macOS-style menu bar, menu "Settings >" with a single
- *                  "About" item that intentionally does nothing (no logo)
- *   - mouse:       PS/2 (psmouse) via /dev/input/mice -> software cursor,
- *                  hover highlights, click opens/closes the menu
- *   - top-right:   live FPS counter (really measured, updated twice a second)
+ *   - boot:        live kernel log lines (from /dev/kmsg, real records) in the
+ *                  bottom-left corner, white macOS-style arc spinner in center
+ *   - transition:  smooth 1.4 s crossfade into the desktop
+ *   - desktop:     wallpaper + frosted menu bar ("Settings >" -> "About"),
+ *                  dark frosted dock with the Terminal app (icon magnifies on
+ *                  hover like macOS), live FPS counter top-right
+ *   - terminal:    real terminal window (busybox sh on a pty, keyboard input
+ *                  via evdev) with macOS chrome: traffic lights, shadow,
+ *                  open/minimize/restore/close animations
+ *   - rendering:   dirty-rect compositor: only regions that actually changed
+ *                  are recomposed and pushed to the framebuffer, which keeps
+ *                  the loop at ~60 fps even under emulation at 1920x1080
  *
  * No fake data: every log line is a genuine kernel record with its genuine
  * kernel timestamp, the FPS number is a genuine measurement of frames
- * actually rendered. If the system has nothing to say, nothing is displayed.
+ * actually composed, the terminal runs a real shell.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -29,35 +32,47 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/fb.h>
+#include <linux/input.h>
+#include <linux/kd.h>
 
 #include "font.h"
+#include "terminal_icon.h"
 
 /* ---------------- tuning ------------------------------------------- */
 #define WALL_PATH        "/usr/share/splash/wallpaper.raw"
 #define DONE_PATH        "/run/bootdone"
 #define READY_PATH       "/run/splash.ready"
 #define KMSG_PATH        "/dev/kmsg"
-#define WALL_W           1024
-#define WALL_H           768
-#define FADE_SECONDS     1.4     /* crossfade duration                */
-#define SPIN_PERIOD      1.25    /* seconds per spinner revolution    */
-#define REVEAL_PER_FRAME 3       /* log lines revealed per frame      */
-#define DISPLAY_LINES    14      /* log lines visible simultaneously  */
-#define LOG_MARGIN       16      /* log area margin, px               */
+#define WALL_W           1920    /* baked wallpaper size (build-time)   */
+#define WALL_H           1080
+#define FADE_SECONDS     1.4     /* crossfade duration                  */
+#define SPIN_PERIOD      1.25    /* seconds per spinner revolution      */
+#define REVEAL_PER_FRAME 3       /* log lines revealed per frame        */
+#define DISPLAY_LINES    14      /* log lines visible simultaneously    */
+#define LOG_MARGIN       16      /* log area margin, px                 */
 #define LOG_LINE_MAX     160
 #define HIST_MAX         512
-#define SAFETY_SECONDS   45.0    /* fade even if init never signals   */
+#define SAFETY_SECONDS   45.0    /* fade even if init never signals     */
 #define FRAME_DT         (1.0 / 60.0)
-#define FPS_WINDOW       0.5     /* FPS averaging window, seconds     */
+#define FPS_WINDOW       0.5     /* FPS averaging window, seconds       */
 #define MENU_TITLE       "Settings >"
-#define MENU_X           12      /* menu title x, px                  */
-#define DOCK_W           280     /* empty dock width, px              */
-#define DOCK_MARGIN_B    7       /* dock gap from the bottom edge     */
-#define CURSOR_W         13
+#define MENU_X           12      /* menu title x offset, px             */
+#define DOCK_MARGIN_B    7       /* dock gap from the bottom edge, px   */
+#define CURSOR_W         13      /* arrow cursor sprite, px (scaled)    */
 #define CURSOR_H         19
+#define ICON_BASE        60      /* dock icon size, unit-px             */
+#define DOCK_W           280     /* dock width, unit-px                 */
+#define TERM_TITLE       "Terminal - sh"
+#define TERM_DONE        "Done - sh"
+
+/* terminal grid limits */
+#define TCOLS_MAX 130
+#define TROWS_MAX 40
 
 static const int LOG_R = 185, LOG_G = 187, LOG_B = 193;
 
@@ -75,16 +90,41 @@ static int panel_h;       /* macOS-style top panel height              */
 static int fps_now;       /* real measured frames per second           */
 static bool fps_ready;    /* first measurement window completed        */
 
+/* clip rect (inclusive); every draw must respect it                     */
+static int cx0, cy0, cx1, cy1;
+
+static inline void clip_full(void) { cx0 = 0; cy0 = 0; cx1 = W - 1; cy1 = H - 1; }
+static inline bool in_clip(int x, int y)
+{
+    return x >= cx0 && x <= cx1 && y >= cy0 && y <= cy1;
+}
+
+/* UI scales */
+static int fs;            /* UI font scale: 1 or 2                     */
+static double u;          /* linear unit scale, H/768                  */
+
 /* mouse / menu / cursor state */
 static int mouse_fd = -1;
+static int vt_fd = -1;    /* /dev/tty0 kept open in KD_GRAPHICS mode    */
 static double mouse_try = 0;
 static int mx, my;        /* cursor position, hotspot at the tip       */
+static int pmx, pmy;      /* cursor position on the previous frame     */
 static int btn_l;         /* left button state                         */
+static double last_clk = -1;  /* click debounce timer                      */
 static bool menu_open = false;
+static double menu_a = 0; /* dropdown animation 0..1                   */
+static bool menu_closing = false;
 static bool in_desktop = false;
 static int ti_x0, ti_y0, ti_x1, ti_y1;   /* "Settings >" title rect    */
 static int dd_x0, dd_y0, dd_x1, dd_y1;   /* dropdown rect              */
 static int it_x0, it_y0, it_x1, it_y1;   /* About item rect            */
+
+/* dock state */
+static int ddx0, ddy0, ddx1, ddy1;       /* dock glass rect            */
+static int dock_h;
+static double icon_s = 1.0;              /* current magnification      */
+static double icon_s_drawn = -1.0;       /* last drawn magnification   */
+static bool dock_dot_drawn = false;      /* running-dot visibility     */
 
 static double now(void)
 {
@@ -119,7 +159,11 @@ static int fb_open(void)
         return -1;
     fast32 = (BPP == 4 && rf.offset == 16 && gf.offset == 8 && bf.offset == 0 &&
               rf.length == 8 && gf.length == 8 && bf.length == 8);
-    fprintf(stderr, "splash: fb0 %dx%d %dbpp (fast32=%d)\n", W, H, BPP * 8, fast32);
+    fs = H >= 1000 ? 2 : 1;
+    u = (double)H / 768.0;
+    clip_full();
+    fprintf(stderr, "splash: fb0 %dx%d %dbpp (fast32=%d, fs=%d, u=%.3f)\n",
+            W, H, BPP * 8, fast32, fs, u);
     return 0;
 }
 
@@ -128,40 +172,102 @@ static inline uint32_t rgb(uint32_t r, uint32_t g, uint32_t b)
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
-static void blit(void)
+/* push a rect of `back` to the framebuffer (per-pixel conversion if needed) */
+static void blit_rect(int x0, int y0, int x1, int y1)
 {
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > W - 1) x1 = W - 1;
+    if (y1 > H - 1) y1 = H - 1;
+    if (x0 > x1 || y0 > y1)
+        return;
+    int rw = x1 - x0 + 1;
     if (fast32) {
-        memcpy(fb_map, back, (size_t)W * H * 4);
+        for (int y = y0; y <= y1; y++)
+            memcpy(fb_map + (size_t)y * finfo.line_length + (size_t)x0 * 4,
+                   back + (size_t)y * W + x0, (size_t)rw * 4);
         return;
     }
-    for (int y = 0; y < H; y++) {
-        const uint32_t *src = back + (size_t)y * W;
+    for (int y = y0; y <= y1; y++) {
+        const uint32_t *src = back + (size_t)y * W + x0;
         uint8_t *row = fb_map + (size_t)y * finfo.line_length;
         if (BPP == 4) {
-            uint32_t *d = (uint32_t *)row;
-            for (int x = 0; x < W; x++) {
+            uint32_t *d = (uint32_t *)row + x0;
+            for (int x = 0; x < rw; x++) {
                 uint32_t v = src[x];
                 d[x] = (((v >> 16 & 255) >> (8 - rf.length)) << rf.offset) |
                        (((v >>  8 & 255) >> (8 - gf.length)) << gf.offset) |
                        (((v       & 255) >> (8 - bf.length)) << bf.offset);
             }
         } else if (BPP == 3) {
-            for (int x = 0; x < W; x++) {
+            for (int x = 0; x < rw; x++) {
                 uint32_t v = src[x];
                 uint32_t val = (((v >> 16 & 255) >> (8 - rf.length)) << rf.offset) |
                                (((v >>  8 & 255) >> (8 - gf.length)) << gf.offset) |
                                (((v       & 255) >> (8 - bf.length)) << bf.offset);
-                uint8_t *d = row + (size_t)x * 3;
+                uint8_t *d = row + (size_t)(x0 + x) * 3;
                 d[0] = val & 0xff; d[1] = (val >> 8) & 0xff; d[2] = (val >> 16) & 0xff;
             }
         } else if (BPP == 2) {
-            uint16_t *d = (uint16_t *)row;
-            for (int x = 0; x < W; x++) {
+            uint16_t *d = (uint16_t *)row + x0;
+            for (int x = 0; x < rw; x++) {
                 uint32_t v = src[x];
                 d[x] = (((v >> 16 & 255) >> (8 - rf.length)) << rf.offset) |
                        (((v >>  8 & 255) >> (8 - gf.length)) << gf.offset) |
                        (((v       & 255) >> (8 - bf.length)) << bf.offset);
             }
+        }
+    }
+}
+
+/* blend `alpha` (0..256) of `tex` over `back` at 1:1, clipped */
+static void tex_blit(const uint32_t *tex, int tx, int ty, int tw, int th, int alpha)
+{
+    int x0 = tx < cx0 ? cx0 : tx;
+    int y0 = ty < cy0 ? cy0 : ty;
+    int x1 = tx + tw - 1 > cx1 ? cx1 : tx + tw - 1;
+    int y1 = ty + th - 1 > cy1 ? cy1 : ty + th - 1;
+    for (int y = y0; y <= y1; y++) {
+        const uint32_t *s = tex + (size_t)(y - ty) * tw + (x0 - tx);
+        uint32_t *d = back + (size_t)y * W + x0;
+        if (alpha >= 256) {
+            memcpy(d, s, (size_t)(x1 - x0 + 1) * 4);
+        } else {
+            for (int x = 0; x <= x1 - x0; x++) {
+                uint32_t v = d[x], w = s[x];
+                unsigned r = ((v >> 16 & 255) * (256 - alpha) + (w >> 16 & 255) * alpha) >> 8;
+                unsigned g = ((v >>  8 & 255) * (256 - alpha) + (w >>  8 & 255) * alpha) >> 8;
+                unsigned b = ((v       & 255) * (256 - alpha) + (w       & 255) * alpha) >> 8;
+                d[x] = rgb(r, g, b);
+            }
+        }
+    }
+}
+
+/* nearest-neighbour scaled blend of `tex` into an arbitrary dst rect */
+static void tex_blit_scaled(const uint32_t *tex, int tw, int th,
+                            int dx0, int dy0, int dx1, int dy1, int alpha)
+{
+    if (dx1 < dx0 || dy1 < dy0 || tw <= 0 || th <= 0)
+        return;
+    int dw = dx1 - dx0 + 1, dh = dy1 - dy0 + 1;
+    int x0 = dx0 < cx0 ? cx0 : dx0;
+    int y0 = dy0 < cy0 ? cy0 : dy0;
+    int x1 = dx1 > cx1 ? cx1 : dx1;
+    int y1 = dy1 > cy1 ? cy1 : dy1;
+    for (int y = y0; y <= y1; y++) {
+        int sy = (int)(((long)(y - dy0) * th) / dh);
+        if (sy >= th) sy = th - 1;
+        const uint32_t *srow = tex + (size_t)sy * tw;
+        uint32_t *d = back + (size_t)y * W;
+        for (int x = x0; x <= x1; x++) {
+            int sx = (int)(((long)(x - dx0) * tw) / dw);
+            if (sx >= tw) sx = tw - 1;
+            uint32_t v = d[x], w = srow[sx];
+            unsigned r = ((v >> 16 & 255) * (256 - alpha) + (w >> 16 & 255) * alpha) >> 8;
+            unsigned g = ((v >>  8 & 255) * (256 - alpha) + (w >>  8 & 255) * alpha) >> 8;
+            unsigned b = ((v       & 255) * (256 - alpha) + (w       & 255) * alpha) >> 8;
+            d[x] = rgb(r, g, b);
         }
     }
 }
@@ -186,11 +292,13 @@ static int wall_load(void)
         return -1;
     }
     for (int y = 0; y < H; y++) {             /* nearest-neighbour cover */
-        int sy = y * WALL_H / H;
+        int sy = (int)((long)y * WALL_H / H);
+        if (sy >= WALL_H) sy = WALL_H - 1;
         const uint8_t *s = raw + (size_t)sy * WALL_W * 3;
         uint32_t *d = wall + (size_t)y * W;
         for (int x = 0; x < W; x++) {
-            int sx = x * WALL_W / W;
+            int sx = (int)((long)x * WALL_W / W);
+            if (sx >= WALL_W) sx = WALL_W - 1;
             d[x] = rgb(s[sx * 3], s[sx * 3 + 1], s[sx * 3 + 2]);
         }
     }
@@ -198,10 +306,7 @@ static int wall_load(void)
     return 0;
 }
 
-/* ---------------- desktop panel --------------------------------------- */
-/* macOS-style menu bar: a frosted-glass strip (blurred + lightened wallpaper)
- * with a hairline at the bottom. Empty for now. */
-
+/* ---------------- blur / sdf helpers ---------------------------------- */
 static void box_blur_h(uint32_t *dst, const uint32_t *src, int w, int h, int R)
 {
     int *P = malloc(sizeof(int) * (size_t)(w + 1));
@@ -260,9 +365,29 @@ static double sd_round(double px, double py,
     return sqrt(ax * ax + ay * ay) + fmin(fmax(qx, qy), 0.0) - r;
 }
 
+/* ---------------- terminal window geometry & textures ------------------ */
+static int ww, wh, wx, wy;        /* terminal window target rect (normal) */
+static int tw_title;              /* title bar height                     */
+static uint32_t *winbuf;          /* window texture (max size)            */
+static int winbuf_w, winbuf_h;    /* current texture dims                 */
+static uint32_t *winblur;         /* blurred backdrop under the window    */
+static int winblur_w, winblur_h, winblur_x0, winblur_y0;
+static int mw_x0, mw_y0, mw_x1, mw_y1;   /* maximized ("zoomed") rect     */
+
+/* terminal states */
+enum TmSt { TM_CLOSED, TM_OPENING, TM_OPEN, TM_MINIMIZING, TM_MINIMIZED,
+            TM_RESTORE, TM_CLOSING, TM_ZOOMIN, TM_ZOOMOUT };
+static enum TmSt tm = TM_CLOSED;
+static bool tm_dead = false;      /* shell exited                         */
+static bool caret_on = true;      /* caret blink phase                    */
+
+#define ANIM_MS   0.20            /* window animation duration, s         */
+#define MENU_MS   0.15            /* dropdown animation duration, s       */
+
+/* ---------------- desktop panel --------------------------------------- */
 static void build_desktop(void)
 {
-    panel_h = (int)fmax(24.0, H * 0.036);
+    panel_h = (int)fmax(26.0, H * 0.050);
     if (panel_h > H / 4)
         panel_h = H / 4;
     desktop = malloc((size_t)W * H * 4);
@@ -305,16 +430,20 @@ static void build_desktop(void)
         desktop[(size_t)(panel_h - 1) * W + x] = rgb(r, g, b);
     }
 
-    /* ---- dock: empty frosted dark-glass bar at the bottom, macOS-style ---- */
-    int dock_h = (int)fmax(52.0, H * 0.075);
+    /* ---- dock: frosted dark-glass bar at the bottom, macOS-style ---- */
+    dock_h = (int)(ICON_BASE * u) + (int)(20 * u);
+    if (dock_h < 52)
+        dock_h = 52;
     if (dock_h > H / 5)
         dock_h = H / 5;
-    int dock_w = DOCK_W;
+    int dock_w = (int)(DOCK_W * u);
     if (dock_w > W - 60)
         dock_w = W - 60;
+    if (dock_w < (int)(ICON_BASE * u) + (int)(24 * u))
+        dock_w = (int)(ICON_BASE * u) + (int)(24 * u);
     int dock_r = dock_h * 30 / 100;
-    int ddx0 = (W - dock_w) / 2, ddx1 = ddx0 + dock_w - 1;
-    int ddy1 = H - DOCK_MARGIN_B - 1, ddy0 = ddy1 - dock_h + 1;
+    ddx0 = (W - dock_w) / 2; ddx1 = ddx0 + dock_w - 1;
+    ddy1 = H - DOCK_MARGIN_B - 1; ddy0 = ddy1 - dock_h + 1;
 
     const int BM = 20;                        /* blur margin around the dock */
     int bx0 = ddx0 - BM < 0 ? 0 : ddx0 - BM;
@@ -372,8 +501,47 @@ static void build_desktop(void)
     }
     free(s3);
     free(s4);
-    fprintf(stderr, "splash: desktop ready (panel %d px, dock %dx%d)\n",
-            panel_h, dock_w, dock_h);
+
+    /* ---- terminal window geometry + frosted backdrop ---- */
+    ww = W * 46 / 100;
+    wh = H * 56 / 100;
+    if (ww > W - 80) ww = W - 80;
+    if (wh > H - panel_h - dock_h - 60) wh = H - panel_h - dock_h - 60;
+    wx = (W - ww) / 2;
+    wy = panel_h + (int)(30 * u);
+    tw_title = (int)(30 * u);
+    if (tw_title < 26)
+        tw_title = 26;
+    /* maximized rect: full work area between panel and dock */
+    mw_x0 = (int)(6 * u);
+    mw_y0 = panel_h + 2;
+    mw_x1 = W - 1 - (int)(6 * u);
+    mw_y1 = ddy0 - (int)(10 * u);
+
+    const int SM = (int)(44 * u);             /* blur margin around window */
+    int kx0 = wx - SM < 0 ? 0 : wx - SM;
+    int ky0 = wy - SM < 0 ? 0 : wy - SM;
+    int kx1 = wx + ww + SM > W - 1 ? W - 1 : wx + ww + SM;
+    int ky1 = wy + wh + SM > H - 1 ? H - 1 : wy + wh + SM;
+    winblur_x0 = kx0; winblur_y0 = ky0;
+    winblur_w = kx1 - kx0 + 1; winblur_h = ky1 - ky0 + 1;
+    s3 = malloc((size_t)winblur_w * winblur_h * 4);
+    s4 = malloc((size_t)winblur_w * winblur_h * 4);
+    if (s3 && s4) {
+        for (int y = 0; y < winblur_h; y++)
+            memcpy(s3 + (size_t)y * winblur_w,
+                   desktop + (size_t)(ky0 + y) * W + kx0, (size_t)winblur_w * 4);
+        box_blur_h(s4, s3, winblur_w, winblur_h, 12);
+        box_blur_v(s3, s4, winblur_w, winblur_h, 6);
+        winblur = s3;
+    } else {
+        free(s3);
+    }
+    free(s4);
+
+    winbuf = malloc((size_t)W * (size_t)(H - panel_h) * 4);
+    fprintf(stderr, "splash: desktop ready (panel %d, dock %dx%d, win %dx%d@%d,%d)\n",
+            panel_h, ddx1 - ddx0 + 1, dock_h, ww, wh, wx, wy);
 }
 
 /* ---------------- kernel log ------------------------------------------ */
@@ -454,8 +622,14 @@ static void reveal(void)
     }
 }
 
-/* ---------------- drawing --------------------------------------------- */
-static void draw_char(int x, int y, char ch, uint32_t col)
+/* ---------------- rect helper ------------------------------------------- */
+static bool in_rect(int x, int y, int x0, int y0, int x1, int y1)
+{
+    return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+}
+
+/* ---------------- drawing primitives (clipped) ------------------------- */
+static void draw_char_s(int x, int y, char ch, uint32_t col, int s)
 {
     if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
         return;
@@ -464,36 +638,118 @@ static void draw_char(int x, int y, char ch, uint32_t col)
         unsigned char rowb = gl[ry];
         if (!rowb)
             continue;
-        uint32_t *d = back + (size_t)(y + ry) * W + x;
-        for (int rx = 0; rx < FONT_W; rx++)
-            if (rowb & (0x80 >> rx))
-                d[rx] = col;
+        for (int rx = 0; rx < FONT_W; rx++) {
+            if (!(rowb & (0x80 >> rx)))
+                continue;
+            for (int by = 0; by < s; by++) {
+                int py = y + ry * s + by;
+                if (py < cy0 || py > cy1)
+                    continue;
+                uint32_t *d = back + (size_t)py * W;
+                for (int bx = 0; bx < s; bx++) {
+                    int px = x + rx * s + bx;
+                    if (px < cx0 || px > cx1)
+                        continue;
+                    d[px] = col;
+                }
+            }
+        }
     }
 }
 
-static void draw_text(int x, int y, const char *s, uint32_t col)
+static int font_w_s(int s) { return FONT_W * s; }
+static int font_h_s(int s) { return FONT_H * s; }
+
+static void draw_text_s(int x, int y, const char *str, uint32_t col, int s)
 {
-    int maxc = (W - 2 * LOG_MARGIN) / FONT_W;
-    for (int i = 0; s[i] && i < maxc; i++)
-        draw_char(x + i * FONT_W, y, s[i], col);
+    int maxc = (W - 2 * LOG_MARGIN) / font_w_s(s);
+    for (int i = 0; str[i] && i < maxc; i++)
+        draw_char_s(x + i * font_w_s(s), y, str[i], col, s);
+}
+
+/* anti-aliased rounded rect: fill (border=0) or 1px edge band */
+static void paint_round(int x0, int y0, int x1, int y1, int r,
+                        uint32_t col, int A, int border)
+{
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > W - 1) x1 = W - 1;
+    if (y1 > H - 1) y1 = H - 1;
+    if (x0 > x1 || y0 > y1)
+        return;
+    int cr = col >> 16 & 255, cg = col >> 8 & 255, cb = col & 255;
+    for (int y = y0; y <= y1; y++) {
+        if (y < cy0 || y > cy1)
+            continue;
+        for (int x = x0; x <= x1; x++) {
+            if (x < cx0 || x > cx1)
+                continue;
+            double d = sd_round(x + 0.5, y + 0.5, x0, y0, x1, y1, r);
+            double cov = border ? (0.5 - fabs(d)) * 0.6 : 0.5 - d;
+            if (cov <= 0)
+                continue;
+            if (cov > 1)
+                cov = 1;
+            int a = (int)(cov * A + 0.5);
+            if (a <= 0)
+                continue;
+            uint32_t ob = back[(size_t)y * W + x];
+            unsigned rr = ((ob >> 16 & 255) * (255 - a) + cr * a) / 255;
+            unsigned gg = ((ob >>  8 & 255) * (255 - a) + cg * a) / 255;
+            unsigned bb = ((ob       & 255) * (255 - a) + cb * a) / 255;
+            back[(size_t)y * W + x] = rgb(rr, gg, bb);
+        }
+    }
+}
+
+/* filled anti-aliased disc */
+static void paint_disc(double ccx, double ccy, double rad, uint32_t col, int A)
+{
+    int x0 = (int)floor(ccx - rad - 1), x1 = (int)ceil(ccx + rad + 1);
+    int y0 = (int)floor(ccy - rad - 1), y1 = (int)ceil(ccy + rad + 1);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > W - 1) x1 = W - 1;
+    if (y1 > H - 1) y1 = H - 1;
+    int cr = col >> 16 & 255, cg = col >> 8 & 255, cb = col & 255;
+    for (int y = y0; y <= y1; y++) {
+        if (y < cy0 || y > cy1)
+            continue;
+        for (int x = x0; x <= x1; x++) {
+            if (x < cx0 || x > cx1)
+                continue;
+            double dx = x + 0.5 - ccx, dy = y + 0.5 - ccy;
+            double cov = 0.5 + rad - sqrt(dx * dx + dy * dy);
+            if (cov <= 0)
+                continue;
+            if (cov > 1)
+                cov = 1;
+            int a = (int)(cov * A + 0.5);
+            uint32_t ob = back[(size_t)y * W + x];
+            unsigned rr = ((ob >> 16 & 255) * (255 - a) + cr * a) / 255;
+            unsigned gg = ((ob >>  8 & 255) * (255 - a) + cg * a) / 255;
+            unsigned bb = ((ob       & 255) * (255 - a) + cb * a) / 255;
+            back[(size_t)y * W + x] = rgb(rr, gg, bb);
+        }
+    }
 }
 
 /* macOS-like white arc spinner with anti-aliasing and a fading tail */
-static void draw_spinner(double cx, double cy, double R, double rot)
+static void draw_spinner(double ccx, double ccy, double R, double rot)
 {
     double sw = fmax(2.5, R * 0.15);          /* stroke width  */
     double span = M_PI * 0.60;                /* arc length    */
     double track_a = 0.14;
-    double lx = cx + cos(rot) * R, ly = cy + sin(rot) * R;
-    int x0 = (int)floor(cx - R - sw * 2), x1 = (int)ceil(cx + R + sw * 2);
-    int y0 = (int)floor(cy - R - sw * 2), y1 = (int)ceil(cy + R + sw * 2);
+    double lx = ccx + cos(rot) * R, ly = ccy + sin(rot) * R;
+    int x0 = (int)floor(ccx - R - sw * 2), x1 = (int)ceil(ccx + R + sw * 2);
+    int y0 = (int)floor(ccy - R - sw * 2), y1 = (int)ceil(ccy + R + sw * 2);
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > W - 1) x1 = W - 1;
     if (y1 > H - 1) y1 = H - 1;
     for (int py = y0; py <= y1; py++) {
         for (int px = x0; px <= x1; px++) {
-            double dx = px + 0.5 - cx, dy = py + 0.5 - cy;
+            double dx = px + 0.5 - ccx, dy = py + 0.5 - ccy;
             double dist = sqrt(dx * dx + dy * dy);
             double cov = 0.5 + sw * 0.5 - fabs(dist - R);   /* radial AA */
             if (cov <= 0)
@@ -531,43 +787,1120 @@ static void draw_spinner(double cx, double cy, double R, double rot)
     }
 }
 
-static void blend_tex(uint32_t *tex, int A)   /* A: 0..256 */
+/* ---------------- cursor ------------------------------------------------ */
+/* classic white arrow with black outline ('X' = outline, 'W' = fill);
+ * drawn at 1x or 2x integer scale so it stays crisp */
+static const char *CURSOR_MAP[CURSOR_H] = {
+    "X............",
+    "XX...........",
+    "XWX..........",
+    "XWWX.........",
+    "XWWWX........",
+    "XWWWWX.......",
+    "XWWWWWX......",
+    "XWWWWWWX.....",
+    "XWWWWWWWX....",
+    "XWWWWWWWWX...",
+    "XWWWWWWWWWX..",
+    "XWWWWWWWWWWX.",
+    "XWWWWXXXXXX..",
+    "XWWXWWX......",
+    "XWX.XWWX.....",
+    "XX..XWWX.....",
+    "X....XWWX....",
+    "......XWWX...",
+    ".......XX...."
+};
+static int cur_s;                 /* cursor scale (1 or 2)                */
+static int cur_w, cur_h;          /* scaled cursor size                   */
+
+static void cursor_init(void)
 {
-    for (size_t i = 0; i < (size_t)W * H; i++) {
-        uint32_t v = back[i], wv = tex[i];
-        unsigned r = ((v >> 16 & 255) * (256 - A) + (wv >> 16 & 255) * A) >> 8;
-        unsigned g = ((v >>  8 & 255) * (256 - A) + (wv >>  8 & 255) * A) >> 8;
-        unsigned b = ((v       & 255) * (256 - A) + (wv       & 255) * A) >> 8;
-        back[i] = rgb(r, g, b);
+    cur_s = H >= 1000 ? 2 : 1;
+    cur_w = CURSOR_W * cur_s;
+    cur_h = CURSOR_H * cur_s;
+}
+
+static void draw_cursor(void)
+{
+    for (int pass = 0; pass < 2; pass++) {    /* 0: soft shadow, 1: arrow */
+        int ox = mx + (pass ? 0 : cur_s), oy = my + (pass ? 0 : cur_s);
+        for (int r = 0; r < CURSOR_H; r++) {
+            for (int c = 0; c < CURSOR_W; c++) {
+                char ch = CURSOR_MAP[r][c];
+                if (ch == '.')
+                    continue;
+                int v = pass ? (ch == 'X' ? 0 : 255) : 0;
+                int A = pass ? 255 : 110;
+                for (int by = 0; by < cur_s; by++) {
+                    int py = oy + r * cur_s + by;
+                    if (py < 0 || py >= H)
+                        continue;
+                    for (int bx = 0; bx < cur_s; bx++) {
+                        int px = ox + c * cur_s + bx;
+                        if (px < 0 || px >= W)
+                            continue;
+                        uint32_t ob = back[(size_t)py * W + px];
+                        int rr = ((ob >> 16 & 255) * (255 - A) + v * A) / 255;
+                        int gg = ((ob >>  8 & 255) * (255 - A) + v * A) / 255;
+                        int bb = ((ob       & 255) * (255 - A) + v * A) / 255;
+                        back[(size_t)py * W + px] = rgb(rr, gg, bb);
+                    }
+                }
+            }
+        }
     }
 }
 
-/* ---------------- mouse, menu, cursor --------------------------------- */
-
-static bool in_rect(int x, int y, int x0, int y0, int x1, int y1)
+/* live FPS readout, top-right corner (inside the panel on the desktop) */
+static void fps_bbox(int *bx0, int *by0, int *bx1, int *by1)
 {
-    return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+    int tw = 7 * font_w_s(1);                 /* "999 FPS" worst case */
+    *bx1 = W - LOG_MARGIN + 4;
+    *bx0 = *bx1 - tw - 8;
+    *by0 = (panel_h - font_h_s(1)) / 2 - 2;
+    if (*by0 < 0) *by0 = 0;
+    *by1 = panel_h - 1;
 }
 
-static void handle_click(int x, int y)
+static void draw_fps(int dark)
 {
-    if (!in_desktop)
+    char buf[32];
+    if (!fps_ready)
+        return;                               /* no completed window yet */
+    snprintf(buf, sizeof(buf), "%d FPS", fps_now);
+    int len = 0;
+    while (buf[len])
+        len++;
+    int x = W - LOG_MARGIN - len * font_w_s(1);
+    int y = (panel_h - font_h_s(1)) / 2;
+    if (y < 2)
+        y = 2;
+    draw_text_s(x, y, buf, dark ? rgb(60, 60, 67) : rgb(168, 170, 176), 1);
+}
+
+/* ---------------- menu bar --------------------------------------------- */
+static void menu_geometry(void)
+{
+    int tw = (int)strlen(MENU_TITLE) * font_w_s(fs);
+    ti_x0 = MENU_X - 8;
+    ti_y0 = 0;
+    ti_x1 = MENU_X + tw + 7;
+    ti_y1 = panel_h - 1;
+    dd_x0 = MENU_X - 8;
+    dd_y0 = panel_h + 2;
+    dd_x1 = dd_x0 + (int)(190 * u);
+    dd_y1 = dd_y0 + (int)(48 * u);
+    it_x0 = dd_x0 + (int)(4 * u);
+    it_y0 = dd_y0 + (int)(4 * u);
+    it_x1 = dd_x1 - (int)(4 * u);
+    it_y1 = it_y0 + (int)(40 * u);
+}
+
+static void draw_menu_animated(void)
+{
+    bool hov = in_rect(mx, my, ti_x0, ti_y0, ti_x1, ti_y1);
+    if (menu_open || hov)
+        paint_round(ti_x0, ti_y0, ti_x1, ti_y1, 5, rgb(10, 122, 255), 256, 0);
+    draw_text_s(MENU_X, (panel_h - font_h_s(fs)) / 2, MENU_TITLE,
+                (menu_open || hov) ? rgb(255, 255, 255) : rgb(28, 28, 30), fs);
+    if (menu_a <= 0.003)
         return;
-    if (menu_open) {
-        if (in_rect(x, y, it_x0, it_y0, it_x1, it_y1)) {
-            /* "About" intentionally does nothing */
-        } else if (in_rect(x, y, dd_x0, dd_y0, dd_x1, dd_y1)) {
-            return;                           /* click inside menu padding */
-        } else if (in_rect(x, y, ti_x0, ti_y0, ti_x1, ti_y1)) {
-            menu_open = false;
+
+    /* eased open state: slide + fade */
+    double e = menu_a;
+    e = e * e * (3 - 2 * e);                  /* smoothstep */
+    int slide = (int)((1.0 - e) * -14 * u);
+    int alpha = (int)(e * 250);
+
+    int oy = slide;
+    paint_round(dd_x0 + 2, dd_y0 + 3 + oy, dd_x1 + 2, dd_y1 + 3 + oy,
+                9, rgb(0, 0, 0), alpha * 60 / 250, 0);
+    paint_round(dd_x0, dd_y0 + oy, dd_x1, dd_y1 + oy,
+                8, rgb(246, 246, 248), alpha, 0);
+    paint_round(dd_x0, dd_y0 + oy, dd_x1, dd_y1 + oy,
+                8, rgb(0, 0, 0), alpha * 34 / 250, 1);
+    int iy0 = it_y0 + oy, iy1 = it_y1 + oy;
+    bool ah = in_rect(mx, my, it_x0, iy0, it_x1, iy1);
+    if (ah)
+        paint_round(it_x0, iy0, it_x1, iy1, 5, rgb(10, 122, 255), alpha, 0);
+    draw_text_s(it_x0 + (int)(10 * u),
+                iy0 + (it_y1 - it_y0 - font_h_s(fs)) / 2, "About",
+                ah ? rgb(255, 255, 255) : rgb(28, 28, 30), fs);
+}
+
+/* ---------------- dock icons -------------------------------------------- */
+/* draw the terminal icon (RGBA) with nearest sampling and alpha blending */
+static void draw_icon_rgba(int x, int y, int size)
+{
+    if (size <= 0 || !ICON_DATA)
+        return;
+    int x0 = x < cx0 ? cx0 : x;
+    int y0 = y < cy0 ? cy0 : y;
+    int x1 = x + size - 1 > cx1 ? cx1 : x + size - 1;
+    int y1 = y + size - 1 > cy1 ? cy1 : y + size - 1;
+    for (int py = y0; py <= y1; py++) {
+        int sy = (int)(((long)(py - y) * ICON_H) / size);
+        if (sy >= ICON_H) sy = ICON_H - 1;
+        const unsigned char *srow = ICON_DATA + (size_t)sy * ICON_W * 4;
+        uint32_t *d = back + (size_t)py * W;
+        for (int px = x0; px <= x1; px++) {
+            int sx = (int)(((long)(px - x) * ICON_W) / size);
+            if (sx >= ICON_W) sx = ICON_W - 1;
+            unsigned a = srow[sx * 4 + 3];
+            if (!a)
+                continue;
+            if (a > 255 - 8)
+                a = 255;
+            unsigned r = srow[sx * 4], g = srow[sx * 4 + 1], b = srow[sx * 4 + 2];
+            uint32_t ob = d[px];
+            unsigned orr = ((ob >> 16 & 255) * (255 - a) + r * a) / 255;
+            unsigned ogg = ((ob >>  8 & 255) * (255 - a) + g * a) / 255;
+            unsigned obb = ((ob       & 255) * (255 - a) + b * a) / 255;
+            d[px] = rgb(orr, ogg, obb);
+        }
+    }
+}
+
+/* dock icon geometry for a given magnification */
+static void icon_rect(double s, int *ix0, int *iy0, int *ix1, int *iy1)
+{
+    int size = (int)(ICON_BASE * u * s);
+    int cx = (ddx0 + ddx1) / 2;
+    int bottom = ddy1 - (int)(8 * u);
+    *ix0 = cx - size / 2;
+    *ix1 = *ix0 + size - 1;
+    *iy1 = bottom;
+    *iy0 = bottom - size + 1;
+}
+
+static void draw_dock_icon(void)
+{
+    int ix0, iy0, ix1, iy1;
+    icon_rect(icon_s, &ix0, &iy0, &ix1, &iy1);
+    draw_icon_rgba(ix0, iy0, ix1 - ix0 + 1);
+    /* running dot under the icon while the app is open (macOS-like) */
+    bool running = tm != TM_CLOSED;
+    if (running) {
+        int dcx = (ddx0 + ddx1) / 2;
+        int dy = ddy1 - (int)(4 * u);
+        paint_disc(dcx + 0.5, dy + 0.5, fmax(2.0, 2.5 * u),
+                   rgb(255, 255, 255), 165);
+    }
+}
+
+static void dock_update(double dt)
+{
+    /* magnification: grows when the cursor is near the dock (macOS-like) */
+    bool near = in_desktop && my > ddy0 - (int)(ICON_BASE * u * 1.6) &&
+                mx > ddx0 - (int)(ICON_BASE * u) && mx < ddx1 + (int)(ICON_BASE * u);
+    double target = near ? 1.45 : 1.0;
+    double k = 1.0 - exp(-dt * 14.0);
+    icon_s += (target - icon_s) * k;
+    if (fabs(icon_s - 1.0) < 0.004 && target == 1.0)
+        icon_s = 1.0;
+    if (fabs(icon_s - 1.0) < 0.004 && target == 1.45)
+        icon_s = 1.45;
+}
+
+/* ---------------- terminal emulator ------------------------------------- */
+static uint8_t tch[TCOLS_MAX * TROWS_MAX];
+static uint8_t tfg[TCOLS_MAX * TROWS_MAX];
+static uint8_t tbo[TCOLS_MAX * TROWS_MAX];
+static int t_cols, t_rows;        /* live grid size                        */
+static int tcx, tcy;              /* cursor cell                           */
+static int tfcol = 255;           /* current fg color index, 255 = default */
+static bool tfbold = false;
+static int ansi_st = 0;           /* 0 ground, 1 esc, 2 csi, 3 osc         */
+static char csi_buf[48];
+static int csi_n;
+static bool term_dirty = false;
+static pid_t sh_pid = -1;
+static int sh_fd = -1;
+static bool kbd_ready = false;
+
+/* macOS Terminal "Pro"-like palette (8 basic + 8 bright) */
+static uint32_t PAL[16] = {
+    /*  0 black   */ 0, /* set at runtime via rgb() */
+};
+
+static void pal_init(void)
+{
+    PAL[0]  = rgb(60, 60, 64);
+    PAL[1]  = rgb(255, 98, 90);
+    PAL[2]  = rgb(80, 210, 90);
+    PAL[3]  = rgb(255, 200, 60);
+    PAL[4]  = rgb(90, 150, 255);
+    PAL[5]  = rgb(255, 100, 220);
+    PAL[6]  = rgb(70, 200, 230);
+    PAL[7]  = rgb(210, 210, 214);
+    PAL[8]  = rgb(120, 120, 126);
+    PAL[9]  = rgb(255, 130, 120);
+    PAL[10] = rgb(120, 240, 130);
+    PAL[11] = rgb(255, 220, 110);
+    PAL[12] = rgb(130, 175, 255);
+    PAL[13] = rgb(255, 140, 235);
+    PAL[14] = rgb(115, 220, 245);
+    PAL[15] = rgb(240, 240, 244);
+}
+#define TERM_FG_DEFAULT rgb(235, 235, 238)
+
+static uint32_t cell_color(int i)
+{
+    int f = tfg[i];
+    if (f == 255)
+        return TERM_FG_DEFAULT;
+    if (tbo[i] && f < 8)
+        return PAL[f + 8];
+    return PAL[f];
+}
+
+static void grid_clear_row(int r)
+{
+    memset(tch + (size_t)r * t_cols, 0, (size_t)t_cols);
+    memset(tfg + (size_t)r * t_cols, 255, (size_t)t_cols);
+    memset(tbo + (size_t)r * t_cols, 0, (size_t)t_cols);
+}
+
+static void grid_scroll(void)
+{
+    memmove(tch, tch + t_cols, (size_t)(t_rows - 1) * t_cols);
+    memmove(tfg, tfg + t_cols, (size_t)(t_rows - 1) * t_cols);
+    memmove(tbo, tbo + t_cols, (size_t)(t_rows - 1) * t_cols);
+    grid_clear_row(t_rows - 1);
+}
+
+static void grid_newline(void)
+{
+    tcx = 0;
+    tcy++;
+    if (tcy >= t_rows) {
+        tcy = t_rows - 1;
+        grid_scroll();
+    }
+}
+
+static void term_reset(void)
+{
+    memset(tch, 0, sizeof(tch));
+    memset(tfg, 255, sizeof(tfg));
+    memset(tbo, 0, sizeof(tbo));
+    tcx = tcy = 0;
+    tfcol = 255;
+    tfbold = false;
+    ansi_st = 0;
+    csi_n = 0;
+}
+
+static int csi_param(int idx, int defv)
+{
+    /* parse idx-th (0-based) ';'-separated parameter from csi_buf */
+    int seen = 0, tn = 0;
+    char tmp[16];
+    for (int p = 0; p <= csi_n; p++) {
+        char c = p < csi_n ? csi_buf[p] : ';';
+        if (c >= '0' && c <= '9') {
+            if (tn < 15)
+                tmp[tn++] = c;
+        } else {
+            tmp[tn] = 0;
+            if (seen == idx)
+                return tn ? atoi(tmp) : defv;
+            seen++;
+            tn = 0;
+        }
+    }
+    return defv;
+}
+
+static void sgr(void)
+{
+    /* parse full parameter list for SGR */
+    int vals[16];
+    int n = 0;
+    char tmp[16];
+    int tn = 0;
+    for (int p = 0; p <= csi_n && n < 16; p++) {
+        char c = p < csi_n ? csi_buf[p] : ';';
+        if (c >= '0' && c <= '9' && tn < 15) {
+            tmp[tn++] = c;
+        } else {
+            tmp[tn] = 0;
+            vals[n++] = tn ? atoi(tmp) : 0;
+            tn = 0;
+        }
+    }
+    if (n == 0)
+        vals[n++] = 0;
+    for (int i = 0; i < n; i++) {
+        int v = vals[i];
+        if (v == 0) { tfcol = 255; tfbold = false; }
+        else if (v == 1) tfbold = true;
+        else if (v == 22) tfbold = false;
+        else if (v >= 30 && v <= 37) tfcol = v - 30;
+        else if (v == 39) tfcol = 255;
+        else if (v >= 90 && v <= 97) tfcol = v - 90 + 8;
+    }
+}
+
+static void term_feed(char c)
+{
+    if (ansi_st == 3) {                       /* OSC: swallow until BEL/ST */
+        if (c == 0x07)
+            ansi_st = 0;
+        else if (c == 0x1B)
+            ansi_st = 4;                      /* expect ST (\\) */
+        return;
+    }
+    if (ansi_st == 4) {
+        if (c == '\\')
+            ansi_st = 0;
+        else if (c != 0x1B)
+            ansi_st = 3;
+        return;
+    }
+    if (ansi_st == 1) {                       /* after ESC */
+        if (c == '[') {
+            ansi_st = 2;
+            csi_n = 0;
+        } else if (c == ']') {
+            ansi_st = 3;
+        } else if (c == 'c') {
+            term_reset();
+        } else {
+            ansi_st = 0;
+        }
+        return;
+    }
+    if (ansi_st == 2) {                       /* CSI */
+        if ((c >= '0' && c <= '9') || c == ';' || c == '?' || c == '!') {
+            if (csi_n < (int)sizeof(csi_buf))
+                csi_buf[csi_n++] = c;
             return;
         }
-        menu_open = false;                    /* click outside closes it   */
+        ansi_st = 0;
+        if (c == 'm') { sgr(); return; }
+        if (c == 'A') { tcy -= csi_param(0, 1); if (tcy < 0) tcy = 0; return; }
+        if (c == 'B') { tcy += csi_param(0, 1); if (tcy >= t_rows) tcy = t_rows - 1; return; }
+        if (c == 'C') { tcx += csi_param(0, 1); if (tcx >= t_cols) tcx = t_cols - 1; return; }
+        if (c == 'D') { tcx -= csi_param(0, 1); if (tcx < 0) tcx = 0; return; }
+        if (c == 'E') { grid_newline(); return; }
+        if (c == 'G') { int x = csi_param(0, 1) - 1; tcx = x < 0 ? 0 : (x >= t_cols ? t_cols - 1 : x); return; }
+        if (c == 'H' || c == 'f') {
+            int ry = csi_param(0, 1) - 1, rx = csi_param(1, 1) - 1;
+            tcy = ry < 0 ? 0 : (ry >= t_rows ? t_rows - 1 : ry);
+            tcx = rx < 0 ? 0 : (rx >= t_cols ? t_cols - 1 : rx);
+            return;
+        }
+        if (c == 'J') {
+            int m = csi_param(0, 0);
+            if (m == 2 || m == 3) {
+                term_reset();
+            } else if (m == 0) {
+                memset(tch + (size_t)tcy * t_cols + tcx, 0, (size_t)(t_cols - tcx));
+                memset(tfg + (size_t)tcy * t_cols + tcx, 255, (size_t)(t_cols - tcx));
+                memset(tbo + (size_t)tcy * t_cols + tcx, 0, (size_t)(t_cols - tcx));
+                for (int r = tcy + 1; r < t_rows; r++)
+                    grid_clear_row(r);
+            } else if (m == 1) {
+                memset(tch + (size_t)tcy * t_cols, 0, (size_t)(tcx + 1));
+                memset(tfg + (size_t)tcy * t_cols, 255, (size_t)(tcx + 1));
+                memset(tbo + (size_t)tcy * t_cols, 0, (size_t)(tcx + 1));
+                for (int r = 0; r < tcy; r++)
+                    grid_clear_row(r);
+            }
+            return;
+        }
+        if (c == 'K') {
+            int m = csi_param(0, 0);
+            if (m == 0) {
+                memset(tch + (size_t)tcy * t_cols + tcx, 0, (size_t)(t_cols - tcx));
+                memset(tfg + (size_t)tcy * t_cols + tcx, 255, (size_t)(t_cols - tcx));
+                memset(tbo + (size_t)tcy * t_cols + tcx, 0, (size_t)(t_cols - tcx));
+            } else if (m == 1) {
+                memset(tch + (size_t)tcy * t_cols, 0, (size_t)(tcx + 1));
+                memset(tfg + (size_t)tcy * t_cols, 255, (size_t)(tcx + 1));
+                memset(tbo + (size_t)tcy * t_cols, 0, (size_t)(tcx + 1));
+            } else {
+                grid_clear_row(tcy);
+            }
+            return;
+        }
+        return;                               /* other final bytes ignored */
+    }
+
+    /* ground state */
+    if (c >= 32 && c < 127) {
+        size_t i = (size_t)tcy * t_cols + tcx;
+        tch[i] = (uint8_t)c;
+        tfg[i] = (uint8_t)tfcol;
+        tbo[i] = tfbold;
+        tcx++;
+        if (tcx >= t_cols)
+            grid_newline();
         return;
     }
-    if (in_rect(x, y, ti_x0, ti_y0, ti_x1, ti_y1))
-        menu_open = true;
+    switch (c) {
+    case '\r': tcx = 0; return;
+    case '\n': grid_newline(); return;
+    case '\b': if (tcx > 0) tcx--; return;
+    case '\t': tcx = (tcx / 8 + 1) * 8; if (tcx >= t_cols) grid_newline(); return;
+    case 0x07: return;
+    case 0x1B: ansi_st = 1; return;
+    default: return;                          /* other control bytes */
+    }
 }
+
+/* ---- pty / shell ------------------------------------------------------- */
+static void term_spawn(void)
+{
+    term_reset();
+    t_cols = (ww - (int)(16 * u)) / FONT_W;
+    t_rows = (wh - tw_title - (int)(12 * u)) / FONT_H;
+    if (t_cols > TCOLS_MAX) t_cols = TCOLS_MAX;
+    if (t_rows > TROWS_MAX) t_rows = TROWS_MAX;
+    if (t_cols < 20) t_cols = 20;
+    if (t_rows < 6) t_rows = 6;
+
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (m < 0)
+        return;
+    if (grantpt(m) != 0 || unlockpt(m) != 0) {
+        close(m);
+        return;
+    }
+    char sn[64];
+    snprintf(sn, sizeof(sn), "%s", ptsname(m));
+
+    pid_t p = fork();
+    if (p < 0) {
+        close(m);
+        return;
+    }
+    if (p == 0) {
+        setsid();
+        int s = open(sn, O_RDWR);
+        if (s < 0)
+            _exit(127);
+        ioctl(s, TIOCSCTTY, 0);
+        dup2(s, 0); dup2(s, 1); dup2(s, 2);
+        if (s > 2)
+            close(s);
+        close(m);
+        struct winsize ws;
+        ws.ws_col = (unsigned short)t_cols;
+        ws.ws_row = (unsigned short)t_rows;
+        ws.ws_xpixel = 0;
+        ws.ws_ypixel = 0;
+        ioctl(s, TIOCSWINSZ, &ws);
+        setenv("TERM", "xterm", 1);
+        setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
+        setenv("HOME", "/root", 1);
+        setenv("PWD", "/", 1);
+        setenv("PS1", "aquaos:~$ ", 1);
+        execl("/bin/sh", "sh", (char *)0);
+        _exit(127);
+    }
+    sh_pid = p;
+    sh_fd = m;
+    fcntl(m, F_SETFL, fcntl(m, F_GETFL, 0) | O_NONBLOCK);
+    tm_dead = false;
+    term_dirty = true;
+}
+
+static void term_kill(void)
+{
+    if (sh_fd >= 0) {
+        close(sh_fd);
+        sh_fd = -1;
+    }
+    if (sh_pid > 0) {
+        kill(sh_pid, SIGHUP);
+        sh_pid = -1;
+    }
+}
+
+static void term_poll(void)
+{
+    if (sh_fd < 0)
+        return;
+    uint8_t buf[4096];
+    for (int i = 0; i < 8; i++) {
+        ssize_t n = read(sh_fd, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+        term_dirty = true;
+        for (ssize_t k = 0; k < n; k++)
+            term_feed((char)buf[k]);
+    }
+    if (sh_pid > 0 && waitpid(sh_pid, NULL, WNOHANG) == sh_pid) {
+        sh_pid = -1;
+        tm_dead = true;
+        term_dirty = true;
+        const char *msg = "\r\n[Process completed]";
+        for (const char *q = msg; *q; q++)
+            term_feed(*q);
+    }
+}
+
+static void term_write(const uint8_t *b, int n)
+{
+    if (sh_fd < 0)
+        return;
+    ssize_t w = write(sh_fd, b, (size_t)n);
+    (void)w;                                  /* EAGAIN: keystroke dropped */
+}
+
+/* ---- keyboard (evdev) --------------------------------------------------- */
+static int kbd_fd = -1;
+static double kbd_try = 0;
+static bool kshift = false, kctrl = false, kcaps = false;
+static uint8_t keyq[64];
+static int keyq_n = 0;
+
+static void key_push(const uint8_t *b, int n)
+{
+    for (int i = 0; i < n && keyq_n < (int)sizeof(keyq); i++)
+        keyq[keyq_n++] = b[i];
+}
+
+/* map an evdev key code to terminal bytes; returns length 0..3 */
+static int map_key(uint16_t code, const uint8_t **out)
+{
+    static uint8_t tmp[3];
+    bool sh = kshift;
+    bool up = false;
+
+    if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT) return 0;
+    if (code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL) return 0;
+    if (code == KEY_CAPSLOCK) return 0;
+    if (code == KEY_LEFTALT || code == KEY_RIGHTALT) return 0;
+
+    if (code >= KEY_F1 && code <= KEY_F12) return 0;
+
+    switch (code) {
+    case KEY_ENTER:    tmp[0] = '\r'; *out = tmp; return 1;
+    case KEY_BACKSPACE:tmp[0] = 0x7f; *out = tmp; return 1;
+    case KEY_TAB:      tmp[0] = '\t'; *out = tmp; return 1;
+    case KEY_ESC:      tmp[0] = 0x1b; *out = tmp; return 1;
+    case KEY_SPACE:    tmp[0] = ' ';  *out = tmp; return 1;
+    case KEY_UP:       tmp[0]=0x1b; tmp[1]='['; tmp[2]='A'; *out=tmp; return 3;
+    case KEY_DOWN:     tmp[0]=0x1b; tmp[1]='['; tmp[2]='B'; *out=tmp; return 3;
+    case KEY_RIGHT:    tmp[0]=0x1b; tmp[1]='['; tmp[2]='C'; *out=tmp; return 3;
+    case KEY_LEFT:     tmp[0]=0x1b; tmp[1]='['; tmp[2]='D'; *out=tmp; return 3;
+    case KEY_DELETE:   tmp[0] = 0x7f; *out = tmp; return 1;
+    case KEY_HOME:     tmp[0]=0x1b; tmp[1]='['; tmp[2]='H'; *out=tmp; return 3;
+    case KEY_END:      tmp[0]=0x1b; tmp[1]='['; tmp[2]='F'; *out=tmp; return 3;
+    default: break;
+    }
+
+    char c = 0;
+    if (code >= KEY_1 && code <= KEY_0) {
+        static const char ns[] = "1234567890";
+        static const char ss[] = "!@#$%^&*()";
+        c = sh ? ss[code - KEY_1] : ns[code - KEY_1];
+    } else if (code >= KEY_Q && code <= KEY_P) {
+        static const char ls[] = "qwertyuiop";
+        c = ls[code - KEY_Q];
+        up = true;
+    } else if (code >= KEY_A && code <= KEY_L) {
+        static const char ls[] = "asdfghjkl";
+        c = ls[code - KEY_A];
+        up = true;
+    } else if (code >= KEY_Z && code <= KEY_M) {
+        static const char ls[] = "zxcvbnm";
+        c = ls[code - KEY_Z];
+        up = true;
+    } else {
+        static const struct { uint16_t code; char n, s; } mt[] = {
+            { KEY_MINUS, '-', '_' }, { KEY_EQUAL, '=', '+' },
+            { KEY_LEFTBRACE, '[', '{' }, { KEY_RIGHTBRACE, ']', '}' },
+            { KEY_SEMICOLON, ';', ':' }, { KEY_APOSTROPHE, '\'', '"' },
+            { KEY_GRAVE, '`', '~' }, { KEY_BACKSLASH, '\\', '|' },
+            { KEY_COMMA, ',', '<' }, { KEY_DOT, '.', '>' },
+            { KEY_SLASH, '/', '?' },
+        };
+        for (size_t i = 0; i < sizeof(mt) / sizeof(mt[0]); i++) {
+            if (mt[i].code == code) {
+                c = sh ? mt[i].s : mt[i].n;
+                break;
+            }
+        }
+    }
+    if (!c)
+        return 0;
+    if (up) {
+        bool eff = kcaps ? !sh : sh;
+        if (eff)
+            c = (char)(c - 'a' + 'A');
+        if (kctrl)
+            c = (char)(c & 0x1f);
+    }
+    tmp[0] = (uint8_t)c;
+    *out = tmp;
+    return 1;
+}
+
+static void pump_keyboard(void)
+{
+    if (!kbd_ready) {
+        double t = now();
+        if (t - kbd_try >= 0.25) {
+            kbd_try = t;
+            kbd_fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+            if (kbd_fd >= 0) {
+                kbd_ready = true;
+                fprintf(stderr, "splash: keyboard ready (event0)\n");
+            }
+        }
+        return;
+    }
+    uint8_t buf[sizeof(struct input_event) * 16];
+    for (int k = 0; k < 8; k++) {
+        ssize_t n = read(kbd_fd, buf, sizeof(buf));
+        if (n < (ssize_t)sizeof(struct input_event))
+            break;
+        for (ssize_t off = 0; off + (ssize_t)sizeof(struct input_event) <= n;
+             off += sizeof(struct input_event)) {
+            struct input_event ev;
+            memcpy(&ev, buf + off, sizeof(ev));
+            if (ev.type != EV_KEY)
+                continue;
+            if (ev.value == 1 || ev.value == 2) {          /* press / repeat */
+                const uint8_t *out;
+                int l = map_key(ev.code, &out);
+                if (l > 0)
+                    key_push(out, l);
+            }
+            switch (ev.code) {
+            case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT:
+                kshift = ev.value != 0; break;
+            case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
+                kctrl = ev.value != 0; break;
+            case KEY_CAPSLOCK:
+                if (ev.value == 1) kcaps = !kcaps; break;
+            default: break;
+            }
+        }
+        if (n < (ssize_t)sizeof(buf))
+            break;
+    }
+}
+
+/* ---------------- terminal window texture rendering ---------------------- */
+/* render the window texture at (w x h); the grid is anchored top-left of the
+ * body so text never stretches at the final animation states */
+static void render_winbuf(int w, int h)
+{
+    if (!winbuf || w <= 0 || h <= 0)
+        return;
+    winbuf_w = w; winbuf_h = h;
+
+    /* body: frosted dark glass from the pre-blurred backdrop */
+    if (winblur) {
+        for (int y = 0; y < h; y++) {
+            uint32_t *d = winbuf + (size_t)y * w;
+            for (int x = 0; x < w; x++) {
+                int bx = x + (wx - winblur_x0);
+                int by = y + (wy - winblur_y0);
+                if (bx < 0) bx = 0;
+                if (by < 0) by = 0;
+                if (bx >= winblur_w) bx = winblur_w - 1;
+                if (by >= winblur_h) by = winblur_h - 1;
+                uint32_t v = winblur[(size_t)by * winblur_w + bx];
+                /* ~12% blurred backdrop + ~88% dark tint */
+                unsigned r = ((v >> 16 & 255) * 31 + 20 * 225) >> 8;
+                unsigned g = ((v >>  8 & 255) * 31 + 20 * 225) >> 8;
+                unsigned b = ((v       & 255) * 34 + 24 * 225) >> 8;
+                d[x] = rgb(r, g, b);
+            }
+        }
+    } else {
+        for (int i = 0; i < w * h; i++)
+            winbuf[i] = rgb(22, 22, 26);
+    }
+
+    /* title bar: light gradient (macOS light chrome) */
+    int r0 = 238, g0 = 238, b0 = 240, r1 = 224, g1 = 224, b1 = 227;
+    for (int y = 0; y < tw_title && y < h; y++) {
+        double f = (tw_title > 1) ? (double)y / (tw_title - 1) : 0;
+        unsigned r = (unsigned)(r0 + (r1 - r0) * f);
+        unsigned g = (unsigned)(g0 + (g1 - g0) * f);
+        unsigned b = (unsigned)(b0 + (b1 - b0) * f);
+        uint32_t *d = winbuf + (size_t)y * w;
+        for (int x = 0; x < w; x++)
+            d[x] = rgb(r, g, b);
+    }
+    /* hairline under the title bar */
+    if (tw_title < h) {
+        uint32_t *d = winbuf + (size_t)tw_title * w;
+        for (int x = 0; x < w; x++)
+            d[x] = rgb(196, 196, 200);
+    }
+
+    /* traffic lights */
+    {
+        double lr = fmax(5.5, 6.5 * u);
+        double lcy = (tw_title - 1) / 2.0 + 0.5;
+        double lx[3] = { 20 * u, 20 * u + 22 * u, 20 * u + 44 * u };
+        uint32_t lcol[3] = { rgb(255, 95, 87), rgb(254, 188, 46), rgb(40, 200, 64) };
+        for (int i = 0; i < 3; i++) {
+            double ccx = lx[i], ccy = lcy;
+            int x0 = (int)floor(ccx - lr - 1), x1 = (int)ceil(ccx + lr + 1);
+            int y0 = (int)floor(ccy - lr - 1), y1 = (int)ceil(ccy + lr + 1);
+            for (int y = y0; y <= y1; y++) {
+                if (y < 0 || y >= h)
+                    continue;
+                for (int x = x0; x <= x1; x++) {
+                    if (x < 0 || x >= w)
+                        continue;
+                    double dx = x + 0.5 - ccx, dy = y + 0.5 - ccy;
+                    double cov = 0.5 + lr - sqrt(dx * dx + dy * dy);
+                    if (cov <= 0)
+                        continue;
+                    if (cov > 1)
+                        cov = 1;
+                    int a = (int)(cov * 255 + 0.5);
+                    uint32_t ob = winbuf[(size_t)y * w + x];
+                    unsigned orr = ((ob >> 16 & 255) * (255 - a) + (lcol[i] >> 16 & 255) * a) / 255;
+                    unsigned ogg = ((ob >>  8 & 255) * (255 - a) + (lcol[i] >>  8 & 255) * a) / 255;
+                    unsigned obb = ((ob       & 255) * (255 - a) + (lcol[i]       & 255) * a) / 255;
+                    winbuf[(size_t)y * w + x] = rgb(orr, ogg, obb);
+                }
+            }
+        }
+    }
+
+    /* title text, centered in the title bar */
+    {
+        const char *tstr = tm_dead ? TERM_DONE : TERM_TITLE;
+        int len = 0;
+        while (tstr[len]) len++;
+        int tx = (w - len * FONT_W) / 2;
+        int ty = (tw_title - FONT_H) / 2;
+        for (int i = 0; tstr[i]; i++) {
+            char ch = tstr[i];
+            if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
+                continue;
+            const unsigned char *gl = FONT_BITMAP[ch - FONT_FIRST];
+            for (int ry = 0; ry < FONT_H; ry++) {
+                int py = ty + ry;
+                if (py < 0 || py >= tw_title || py >= h)
+                    continue;
+                unsigned char rowb = gl[ry];
+                if (!rowb)
+                    continue;
+                uint32_t *d = winbuf + (size_t)py * w;
+                for (int rx = 0; rx < FONT_W; rx++) {
+                    if (!(rowb & (0x80 >> rx)))
+                        continue;
+                    int px = tx + i * FONT_W + rx;
+                    if (px < 0 || px >= w)
+                        continue;
+                    d[px] = rgb(110, 110, 116);
+                }
+            }
+        }
+    }
+
+    /* terminal grid + caret (only once the shell exists) */
+    if (sh_fd >= 0) {
+        int gx = (int)(8 * u);
+        int gy = tw_title + (int)(4 * u);
+        for (int r = 0; r < t_rows; r++) {
+            int py0 = gy + r * FONT_H;
+            if (py0 >= h)
+                break;
+            for (int c = 0; c < t_cols; c++) {
+                int i = r * t_cols + c;
+                uint8_t ch = tch[i];
+                if (!ch)
+                    continue;
+                if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
+                    ch = '?';
+                const unsigned char *gl = FONT_BITMAP[ch - FONT_FIRST];
+                uint32_t col = cell_color(i);
+                int px0 = gx + c * FONT_W;
+                for (int ry = 0; ry < FONT_H; ry++) {
+                    int py = py0 + ry;
+                    if (py < 0 || py >= h)
+                        continue;
+                    unsigned char rowb = gl[ry];
+                    if (!rowb)
+                        continue;
+                    uint32_t *d = winbuf + (size_t)py * w;
+                    for (int rx = 0; rx < FONT_W; rx++) {
+                        if (!(rowb & (0x80 >> rx)))
+                            continue;
+                        int px = px0 + rx;
+                        if (px < 0 || px >= w)
+                            continue;
+                        d[px] = col;
+                    }
+                }
+            }
+        }
+        /* caret: solid light block at the cursor cell */
+        if (caret_on) {
+            int px0 = gx + tcx * FONT_W;
+            int py0 = gy + tcy * FONT_H;
+            for (int ry = 0; ry < FONT_H; ry++) {
+                int py = py0 + ry;
+                if (py < 0 || py >= h)
+                    continue;
+                uint32_t *d = winbuf + (size_t)py * w;
+                for (int rx = 0; rx < FONT_W; rx++) {
+                    int px = px0 + rx;
+                    if (px < 0 || px >= w)
+                        continue;
+                    d[px] = rgb(235, 235, 238);
+                }
+            }
+        }
+    }
+}
+
+/* soft drop shadow around a rect (macOS-like) */
+static void draw_shadow(int x0, int y0, int x1, int y1)
+{
+    double margin = 36 * u;
+    double sigma = 18 * u;
+    double amax = 115;
+    int ex0 = (int)floor(x0 - margin), ex1 = (int)ceil(x1 + margin);
+    int ey0 = (int)floor(y0 - margin), ey1 = (int)ceil(y1 + margin);
+    if (ex0 < 0) ex0 = 0;
+    if (ey0 < 0) ey0 = 0;
+    if (ex1 > W - 1) ex1 = W - 1;
+    if (ey1 > H - 1) ey1 = H - 1;
+    for (int y = ey0; y <= ey1; y++) {
+        if (y < cy0 || y > cy1)
+            continue;
+        for (int x = ex0; x <= ex1; x++) {
+            if (x < cx0 || x > cx1)
+                continue;
+            if (x >= x0 && x <= x1 && y >= y0 && y <= y1)
+                continue;
+            double d = sd_round(x + 0.5, y + 0.5, x0, y0, x1, y1, 14 * u);
+            if (d > margin)
+                continue;
+            if (d < 0)
+                d = 0;
+            double a = amax * exp(-d / sigma);
+            if (a < 1.5)
+                continue;
+            int A = (int)(a + 0.5);
+            if (A > 255) A = 255;
+            uint32_t ob = back[(size_t)y * W + x];
+            unsigned rr = ((ob >> 16 & 255) * (255 - A)) / 255;
+            unsigned gg = ((ob >>  8 & 255) * (255 - A)) / 255;
+            unsigned bb = ((ob       & 255) * (255 - A)) / 255;
+            back[(size_t)y * W + x] = rgb(rr, gg, bb);
+        }
+    }
+}
+
+/* ---------------- terminal window: states & animations ------------------ */
+/* stable states: CLOSED / OPEN / MINIMIZED; transitions carry an animation */
+static bool tm_anim = false;
+static double tm_t0 = 0;
+static int A_fx0, A_fy0, A_fx1, A_fy1;   /* from rect                     */
+static int A_tx0, A_ty0, A_tx1, A_ty1;   /* to rect                       */
+static int A_fa, A_ta;                   /* from/to alpha                 */
+static enum TmSt A_end = TM_CLOSED;      /* state after animation         */
+static bool A_zoom = false;              /* zoomed after animation        */
+static int A_bufw, A_bufh;               /* winbuf dims during animation  */
+static bool tm_zoomed = false;
+static int force_x0, force_y0, force_x1, force_y1;   /* post-anim repaint  */
+static bool force_dirty = false;
+static bool force_full = false;         /* wipe the whole screen once   */
+
+static void win_norm_rect(int *x0, int *y0, int *x1, int *y1)
+{
+    *x0 = wx; *y0 = wy; *x1 = wx + ww - 1; *y1 = wy + wh - 1;
+}
+
+static bool win_max_rect(int *x0, int *y0, int *x1, int *y1)
+{
+    *x0 = mw_x0; *y0 = mw_y0; *x1 = mw_x1; *y1 = mw_y1;
+    return true;
+}
+
+/* current interpolated rect; returns false when nothing to draw */
+static bool win_cur_rect(int *x0, int *y0, int *x1, int *y1, int *alpha)
+{
+    if (tm_anim) {
+        double t = (now() - tm_t0) / ANIM_MS;
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        double e = 1 - (1 - t) * (1 - t) * (1 - t);   /* ease-out cubic */
+        *x0 = A_fx0 + (int)((A_tx0 - A_fx0) * e);
+        *y0 = A_fy0 + (int)((A_ty0 - A_fy0) * e);
+        *x1 = A_fx1 + (int)((A_tx1 - A_fx1) * e);
+        *y1 = A_fy1 + (int)((A_ty1 - A_fy1) * e);
+        *alpha = A_fa + (int)((A_ta - A_fa) * e);
+        return *alpha > 2;
+    }
+    if (tm == TM_MINIMIZED || tm == TM_CLOSED)
+        return false;
+    if (tm_zoomed)
+        win_max_rect(x0, y0, x1, y1);
+    else
+        win_norm_rect(x0, y0, x1, y1);
+    *alpha = 256;
+    return true;
+}
+
+static void anim_start(enum TmSt end, bool zoom,
+                       int fx0, int fy0, int fx1, int fy1, int fa,
+                       int tx0, int ty0, int tx1, int ty1, int ta,
+                       int bufw, int bufh)
+{
+    A_end = end;
+    A_zoom = zoom;
+    A_fx0 = fx0; A_fy0 = fy0; A_fx1 = fx1; A_fy1 = fy1; A_fa = fa;
+    A_tx0 = tx0; A_ty0 = ty0; A_tx1 = tx1; A_ty1 = ty1; A_ta = ta;
+    A_bufw = bufw; A_bufh = bufh;
+    tm_anim = true;
+    tm_t0 = now();
+}
+
+static void anim_update(void)
+{
+    if (!tm_anim)
+        return;
+    double t = (now() - tm_t0) / ANIM_MS;
+    if (t < 1.0)
+        return;
+    /* force a repaint of the whole 'from' region so no animation frame
+     * can leave ghost pixels behind */
+    force_x0 = A_fx0; force_y0 = A_fy0;
+    force_x1 = A_fx1; force_y1 = A_fy1;
+    force_dirty = true;
+    tm_anim = false;
+    tm = A_end;
+    tm_zoomed = A_zoom;
+    if (tm == TM_MINIMIZED || tm == TM_CLOSED)
+        force_full = true;                 /* wipe any animation residue */
+    if (tm == TM_CLOSED)
+        term_kill();
+    if (tm == TM_OPEN) {
+        int a, b, c, d, al;
+        win_cur_rect(&a, &b, &c, &d, &al);
+        render_winbuf(c - a + 1, d - b + 1);  /* re-render at final dims */
+    }
+    term_dirty = true;
+}
+
+/* ---------------- window actions ---------------------------------------- */
+static void win_open(void)
+{
+    if (tm != TM_CLOSED || tm_anim)
+        return;
+    fprintf(stderr, "ACT open\n");
+    term_spawn();
+    render_winbuf(ww, wh);
+    int ix0, iy0, ix1, iy1;
+    icon_rect(1.0, &ix0, &iy0, &ix1, &iy1);
+    anim_start(TM_OPEN, false,
+               ix0, iy0, ix1, iy1, 40,
+               wx, wy, wx + ww - 1, wy + wh - 1, 256,
+               ww, wh);
+}
+
+static void win_close_start(void)
+{
+    if (tm != TM_OPEN || tm_anim)
+        return;
+    fprintf(stderr, "ACT close\n");
+    int ix0, iy0, ix1, iy1;
+    icon_rect(1.0, &ix0, &iy0, &ix1, &iy1);
+    int a, b, c, d;
+    if (tm_zoomed)
+        win_max_rect(&a, &b, &c, &d);
+    else
+        win_norm_rect(&a, &b, &c, &d);
+    anim_start(TM_CLOSED, false,
+               a, b, c, d, 256,
+               ix0, iy0, ix1, iy1, 0,
+               c - a + 1, d - b + 1);
+}
+
+static void win_minimize(void)
+{
+    if (tm != TM_OPEN || tm_anim)
+        return;
+    fprintf(stderr, "ACT minimize\n");
+    int ix0, iy0, ix1, iy1;
+    icon_rect(1.0, &ix0, &iy0, &ix1, &iy1);
+    int a, b, c, d;
+    if (tm_zoomed)
+        win_max_rect(&a, &b, &c, &d);
+    else
+        win_norm_rect(&a, &b, &c, &d);
+    anim_start(TM_MINIMIZED, tm_zoomed,
+               a, b, c, d, 256,
+               ix0, iy0, ix1, iy1, 0,
+               c - a + 1, d - b + 1);
+}
+
+static void win_restore(void)
+{
+    if (tm != TM_MINIMIZED || tm_anim)
+        return;
+    fprintf(stderr, "ACT restore\n");
+    render_winbuf(ww, wh);
+    int ix0, iy0, ix1, iy1;
+    icon_rect(1.0, &ix0, &iy0, &ix1, &iy1);
+    anim_start(TM_OPEN, false,
+               ix0, iy0, ix1, iy1, 0,
+               wx, wy, wx + ww - 1, wy + wh - 1, 256,
+               ww, wh);
+}
+
+static void win_zoom(void)
+{
+    if (tm != TM_OPEN || tm_anim)
+        return;
+    fprintf(stderr, "ACT zoom (zoomed=%d)\n", tm_zoomed);
+    int a, b, c, d;
+    if (!tm_zoomed) {
+        win_max_rect(&a, &b, &c, &d);
+        anim_start(TM_OPEN, true,
+                   wx, wy, wx + ww - 1, wy + wh - 1, 256,
+                   a, b, c, d, 256,
+                   ww, wh);
+    } else {
+        win_norm_rect(&a, &b, &c, &d);
+        int mx0, my0, mx1, my1;
+        win_max_rect(&mx0, &my0, &mx1, &my1);
+        anim_start(TM_OPEN, false,
+                   mx0, my0, mx1, my1, 256,
+                   a, b, c, d, 256,
+                   mx1 - mx0 + 1, my1 - my0 + 1);
+    }
+}
+
+/* ---------------- window drawing ----------------------------------------- */
+static void draw_window(void)
+{
+    int x0, y0, x1, y1, alpha;
+    if (!win_cur_rect(&x0, &y0, &x1, &y1, &alpha))
+        return;
+    if (alpha >= 250)
+        draw_shadow(x0, y0, x1, y1);
+    int bw = A_bufw, bh = A_bufh;             /* dims the texture was built for */
+    if (!tm_anim) {
+        bw = x1 - x0 + 1;
+        bh = y1 - y0 + 1;
+    }
+    if (bw == x1 - x0 + 1 && bh == y1 - y0 + 1)
+        tex_blit(winbuf, x0, y0, bw, bh, alpha);
+    else
+        tex_blit_scaled(winbuf, bw, bh, x0, y0, x1, y1, alpha);
+}
+
+/* ---------------- mouse --------------------------------------------------- */
+static void handle_click(int x, int y);   /* defined below */
 
 /* mild mouse acceleration for small deltas (PS/2 packets are tiny;
  * large deltas pass 1:1 so automated input stays precise) */
@@ -578,6 +1911,8 @@ static int acc(int d)
     return d > 0 ? s : -s;
 }
 
+/* /dev/input/mice (mousedev): dy uses the device convention (+ = away from
+ * the user = screen UP), so screen-space Y needs the negation */
 static void pump_mouse(void)
 {
     if (mouse_fd < 0) {
@@ -603,14 +1938,28 @@ static void pump_mouse(void)
             if (f & 0x20)
                 dy -= 256;
             mx += acc(dx);
-            my += acc(dy);
+            my -= acc(dy);                        /* device Y is inverted */
             if (mx < 0) mx = 0;
             if (my < 0) my = 0;
             if (mx > W - 1) mx = W - 1;
             if (my > H - 1) my = H - 1;
+            {
+                static double last_pos_log = 0;
+                double tn = now();
+                if ((dx || dy) && tn - last_pos_log >= 1.0) {
+                    last_pos_log = tn;
+                    fprintf(stderr, "POS %d %d\n", mx, my);
+                }
+            }
             int l = f & 0x01;
-            if (l && !btn_l)
-                handle_click(mx, my);
+            if (l && !btn_l) {
+                double tnow = now();
+                if (tnow - last_clk >= 0.08) {   /* debounce QEMU doubles */
+                    last_clk = tnow;
+                    fprintf(stderr, "CLK %d %d\n", mx, my);
+                    handle_click(mx, my);
+                }
+            }
             btn_l = l;
         }
         if (n < (ssize_t)sizeof(b))
@@ -618,144 +1967,189 @@ static void pump_mouse(void)
     }
 }
 
-/* anti-aliased rounded rect: fill (border=0) or 1px edge band */
-static void paint_round(int x0, int y0, int x1, int y1, int r,
-                        uint32_t col, int A, int border)
+/* ---------------- clicks --------------------------------------------------- */
+static void dock_activate(void)
+{
+    if (tm_anim)
+        return;
+    if (tm == TM_CLOSED)
+        win_open();
+    else if (tm == TM_OPEN)
+        win_minimize();
+    else if (tm == TM_MINIMIZED)
+        win_restore();
+}
+
+static bool click_in_buttons(int x, int y, int wx0, int wy0)
+{
+    double lr = fmax(5.5, 6.5 * u) + 4;       /* slop for easier clicks */
+    double lcy = wy0 + (tw_title - 1) / 2.0 + 0.5;
+    double lx[3] = { 20 * u, 20 * u + 22 * u, 20 * u + 44 * u };
+    for (int i = 0; i < 3; i++)
+        if (hypot(x - (wx0 + lx[i]), y - lcy) <= lr)
+            return true;
+    return false;
+}
+
+static void handle_click(int x, int y)
+{
+    if (!in_desktop)
+        return;
+
+    /* menu takes priority while open; any click closes it (macOS behaviour) */
+    if (menu_open) {
+        double e = menu_a * menu_a * (3 - 2 * menu_a);
+        int oy = (int)((1.0 - e) * -14 * u);
+        if (in_rect(x, y, it_x0, it_y0 + oy, it_x1, it_y1 + oy)) {
+            /* "About" intentionally does nothing */
+        }
+        menu_open = false;
+        menu_closing = true;
+        return;
+    }
+
+    /* dock icon */
+    int ix0, iy0, ix1, iy1;
+    icon_rect(icon_s, &ix0, &iy0, &ix1, &iy1);
+    int pad = (int)(9 * u);
+    if (in_rect(x, y, ix0 - pad, iy0 - pad, ix1 + pad, iy1 + pad)) {
+        fprintf(stderr, "HIT dock icon (rect %d,%d-%d,%d)\n", ix0, iy0, ix1, iy1);
+        dock_activate();
+        return;
+    }
+
+    /* window traffic lights (stable, visible window only) */
+    if (tm == TM_OPEN && !tm_anim) {
+        int a, b, c, d, al;
+        win_cur_rect(&a, &b, &c, &d, &al);
+        if (in_rect(x, y, a, b, c, d)) {
+            if (click_in_buttons(x, y, a, b)) {
+                double lr = fmax(5.5, 6.5 * u) + 4;
+                double lcy = b + (tw_title - 1) / 2.0 + 0.5;
+                double lx[3] = { 20 * u, 20 * u + 22 * u, 20 * u + 44 * u };
+                double dist0 = hypot(x - (a + lx[0]), y - lcy);
+                double dist1 = hypot(x - (a + lx[1]), y - lcy);
+                double dist2 = hypot(x - (a + lx[2]), y - lcy);
+                if (dist0 <= lr)
+                    win_close_start();
+                else if (dist1 <= lr)
+                    win_minimize();
+                else if (dist2 <= lr)
+                    win_zoom();
+            }
+            return;                            /* clicks inside are consumed */
+        }
+    }
+
+    if (in_rect(x, y, ti_x0, ti_y0, ti_x1, ti_y1)) {
+        fprintf(stderr, "HIT menu title\n");
+        menu_open = true;
+        menu_closing = false;
+    }
+    fprintf(stderr, "MISS (%d,%d)\n", x, y);
+}
+
+/* ---------------- dirty-rect scene compositor ------------------------------- */
+typedef struct { int x0, y0, x1, y1; } Rect;
+
+static Rect dr[24];
+static int drn;
+
+static void add_rect(int x0, int y0, int x1, int y1)
 {
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > W - 1) x1 = W - 1;
     if (y1 > H - 1) y1 = H - 1;
-    if (x0 > x1 || y0 > y1)
+    if (x0 > x1 || y0 > y1 || drn >= (int)(sizeof(dr) / sizeof(dr[0])))
         return;
-    int cr = col >> 16 & 255, cg = col >> 8 & 255, cb = col & 255;
-    for (int y = y0; y <= y1; y++) {
-        for (int x = x0; x <= x1; x++) {
-            double d = sd_round(x + 0.5, y + 0.5, x0, y0, x1, y1, r);
-            double cov = border ? (0.5 - fabs(d)) * 0.6 : 0.5 - d;
-            if (cov <= 0)
-                continue;
-            if (cov > 1)
-                cov = 1;
-            int a = (int)(cov * A + 0.5);
-            if (a <= 0)
-                continue;
-            uint32_t ob = back[(size_t)y * W + x];
-            unsigned rr = ((ob >> 16 & 255) * (255 - a) + cr * a) / 255;
-            unsigned gg = ((ob >>  8 & 255) * (255 - a) + cg * a) / 255;
-            unsigned bb = ((ob       & 255) * (255 - a) + cb * a) / 255;
-            back[(size_t)y * W + x] = rgb(rr, gg, bb);
-        }
-    }
+    dr[drn].x0 = x0; dr[drn].y0 = y0;
+    dr[drn].x1 = x1; dr[drn].y1 = y1;
+    drn++;
 }
 
-/* menu bar content: title "Settings >" + dropdown with a single "About" */
-static void draw_menu(void)
+static void copy_desktop_rect(int x0, int y0, int x1, int y1)
 {
-    int tw = (int)strlen(MENU_TITLE) * FONT_W;
-    ti_x0 = MENU_X - 8;
-    ti_y0 = 0;
-    ti_x1 = MENU_X + tw + 7;
-    ti_y1 = panel_h - 1;
-    bool hov = in_rect(mx, my, ti_x0, ti_y0, ti_x1, ti_y1);
-    if (menu_open || hov)
-        paint_round(ti_x0, ti_y0, ti_x1, ti_y1, 5, rgb(10, 122, 255), 256, 0);
-    draw_text(MENU_X, (panel_h - FONT_H) / 2, MENU_TITLE,
-              (menu_open || hov) ? rgb(255, 255, 255) : rgb(28, 28, 30));
-    if (!menu_open)
+    for (int y = y0; y <= y1; y++)
+        memcpy(back + (size_t)y * W + x0,
+               desktop + (size_t)y * W + x0, (size_t)(x1 - x0 + 1) * 4);
+}
+
+/* render one scene layer stack inside a rect and push it to the fb */
+static void scene_render(int x0, int y0, int x1, int y1)
+{
+    cx0 = x0 < 0 ? 0 : x0; cy0 = y0 < 0 ? 0 : y0;
+    cx1 = x1 > W - 1 ? W - 1 : x1; cy1 = y1 > H - 1 ? H - 1 : y1;
+    copy_desktop_rect(cx0, cy0, cx1, cy1);
+    draw_dock_icon();
+    draw_window();
+    draw_menu_animated();
+    draw_fps(1);
+    draw_cursor();
+    blit_rect(cx0, cy0, cx1, cy1);
+}
+
+/* boot scene pieces (black background) */
+static void boot_clear(int x0, int y0, int x1, int y1)
+{
+    for (int y = y0; y <= y1; y++)
+        memset(back + (size_t)y * W + x0, 0, (size_t)(x1 - x0 + 1) * 4);
+}
+
+static void boot_log_rect(int *x0, int *y0, int *x1, int *y1)
+{
+    *x0 = LOG_MARGIN - 2;
+    *x1 = W - LOG_MARGIN + 2;
+    *y1 = H - 1;
+    *y0 = H - LOG_MARGIN - DISPLAY_LINES * font_h_s(fs) - 2;
+    if (*y0 < 0) *y0 = 0;
+}
+
+static void boot_spinner_rect(int *x0, int *y0, int *x1, int *y1)
+{
+    double R = fmax(16.0, H * 0.032);
+    double sw = fmax(2.5, R * 0.15);
+    int ccx = W / 2, ccy = H / 2;
+    *x0 = ccx - (int)(R + sw * 2 + 2);
+    *x1 = ccx + (int)(R + sw * 2 + 2);
+    *y0 = ccy - (int)(R + sw * 2 + 2);
+    *y1 = ccy + (int)(R + sw * 2 + 2);
+    if (*x0 < 0) *x0 = 0;
+    if (*y0 < 0) *y0 = 0;
+    if (*x1 > W - 1) *x1 = W - 1;
+    if (*y1 > H - 1) *y1 = H - 1;
+}
+
+static void draw_log_lines(void)
+{
+    int nl = reveal_n < DISPLAY_LINES ? reveal_n : DISPLAY_LINES;
+    if (nl <= 0)
         return;
-    dd_x0 = MENU_X - 8;
-    dd_y0 = panel_h + 2;
-    dd_x1 = dd_x0 + 175;
-    dd_y1 = dd_y0 + 39;
-    paint_round(dd_x0 + 2, dd_y0 + 3, dd_x1 + 2, dd_y1 + 3, 9, rgb(0, 0, 0), 60, 0);
-    paint_round(dd_x0, dd_y0, dd_x1, dd_y1, 8, rgb(246, 246, 248), 244, 0);
-    paint_round(dd_x0, dd_y0, dd_x1, dd_y1, 8, rgb(0, 0, 0), 34, 1);
-    it_x0 = dd_x0 + 4;
-    it_y0 = dd_y0 + 4;
-    it_x1 = dd_x1 - 4;
-    it_y1 = dd_y0 + 33;
-    bool ah = in_rect(mx, my, it_x0, it_y0, it_x1, it_y1);
-    if (ah)
-        paint_round(it_x0, it_y0, it_x1, it_y1, 5, rgb(10, 122, 255), 256, 0);
-    draw_text(it_x0 + 10, it_y0 + 7, "About",
-              ah ? rgb(255, 255, 255) : rgb(28, 28, 30));
+    int first = reveal_n - nl;
+    int ty = H - LOG_MARGIN - nl * font_h_s(fs);
+    for (int i = 0; i < nl; i++)
+        draw_text_s(LOG_MARGIN, ty + i * font_h_s(fs), hist[first + i].text,
+                    rgb(LOG_R, LOG_G, LOG_B), fs);
 }
 
-/* classic white arrow with black outline ('X' = outline, 'W' = fill) */
-static const char *CURSOR_MAP[CURSOR_H] = {
-    "X............",
-    "XX...........",
-    "XWX..........",
-    "XWWX.........",
-    "XWWWX........",
-    "XWWWWX.......",
-    "XWWWWWX......",
-    "XWWWWWWX.....",
-    "XWWWWWWWX....",
-    "XWWWWWWWWX...",
-    "XWWWWWWWWWX..",
-    "XWWWWWWWWWWX.",
-    "XWWWWXXXXXX..",
-    "XWWXWWX......",
-    "XWX.XWWX.....",
-    "XX..XWWX.....",
-    "X....XWWX....",
-    "......XWWX...",
-    ".......XX...."
-};
-
-static void draw_cursor(void)
-{
-    for (int pass = 0; pass < 2; pass++) {    /* 0: soft shadow, 1: arrow */
-        int ox = mx + (pass ? 0 : 1), oy = my + (pass ? 0 : 1);
-        for (int r = 0; r < CURSOR_H; r++) {
-            int py = oy + r;
-            if (py < 0 || py >= H)
-                continue;
-            for (int c = 0; c < CURSOR_W; c++) {
-                char ch = CURSOR_MAP[r][c];
-                if (ch == '.')
-                    continue;
-                int px = ox + c;
-                if (px < 0 || px >= W)
-                    continue;
-                uint32_t ob = back[(size_t)py * W + px];
-                int A = pass ? 255 : 110;
-                int v = pass ? (ch == 'X' ? 0 : 255) : 0;
-                int rr = ((ob >> 16 & 255) * (255 - A) + v * A) / 255;
-                int gg = ((ob >>  8 & 255) * (255 - A) + v * A) / 255;
-                int bb = ((ob       & 255) * (255 - A) + v * A) / 255;
-                back[(size_t)py * W + px] = rgb(rr, gg, bb);
-            }
-        }
-    }
-}
-
-/* live FPS readout, top-right corner (inside the panel on the desktop) */
-static void draw_fps(int dark)
-{
-    char buf[32];
-    if (!fps_ready)
-        return;                               /* no completed window yet */
-    snprintf(buf, sizeof(buf), "%d FPS", fps_now);
-    int len = 0;
-    while (buf[len])
-        len++;
-    int x = W - LOG_MARGIN - len * FONT_W;
-    int y = (panel_h - FONT_H) / 2;
-    if (y < 2)
-        y = 2;
-    draw_text(x, y, buf, dark ? rgb(60, 60, 67) : rgb(168, 170, 176));
-}
-
-/* ---------------- main -------------------------------------------------- */
+/* ---------------- main ------------------------------------------------------ */
 enum St { ST_BOOT, ST_FADE, ST_WALL };
 
 int main(void)
 {
     signal(SIGHUP, SIG_IGN);
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* keep the kernel VT out of the picture: graphics mode stops fbcon from
+     * drawing console text / cursor over our framebuffer (like X.org does);
+     * diagnostics go to the serial port instead of the screen */
+    vt_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+    if (vt_fd >= 0)
+        ioctl(vt_fd, KDSETMODE, KD_GRAPHICS);
+    freopen("/dev/null", "r", stdin);
+    if (!freopen("/dev/ttyS0", "w", stderr))
+        freopen("/dev/null", "w", stderr);
+    setvbuf(stderr, NULL, _IONBF, 0);      /* POS debug must not lag */
 
     kfd = open(KMSG_PATH, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (kfd < 0)
@@ -767,15 +2161,21 @@ int main(void)
     }
     if (wall_load() != 0)
         fprintf(stderr, "splash: wallpaper missing, will fade to black\n");
+    pal_init();
     build_desktop();
+    cursor_init();
+    menu_geometry();
+    icon_s_drawn = 1.0;
 
     double t0 = now(), last = t0, rot = 0, fade0 = 0;
     double fps_t0 = t0;
     int fps_frames = 0;
     enum St st = ST_BOOT;
     bool ready = false;
+    bool scene_invalid = true;
     mx = W / 2;
     my = H / 2;
+    pmx = mx; pmy = my;
 
     for (;;) {
         double t = now();
@@ -784,7 +2184,7 @@ int main(void)
         double dt = (rdt <= 0 || rdt > 0.25) ? FRAME_DT : rdt;
         rot += dt * 2.0 * M_PI / SPIN_PERIOD;
 
-        /* real FPS meter: frames actually rendered per second */
+        /* real FPS meter: frames actually composed per second */
         fps_frames++;
         if (t - fps_t0 >= FPS_WINDOW) {
             fps_now = (int)(fps_frames / (t - fps_t0) + 0.5);
@@ -801,47 +2201,179 @@ int main(void)
                 st = ST_FADE;
                 fade0 = t;
             }
+
+            int lx0, ly0, lx1, ly1, sx0, sy0, sx1, sy1, fx0, fy0, fx1, fy1;
+            boot_log_rect(&lx0, &ly0, &lx1, &ly1);
+            boot_spinner_rect(&sx0, &sy0, &sx1, &sy1);
+            fps_bbox(&fx0, &fy0, &fx1, &fy1);
+
+            boot_clear(lx0, ly0, lx1, ly1);
+            clip_full();
+            cx0 = lx0; cy0 = ly0; cx1 = lx1; cy1 = ly1;
+            draw_log_lines();
+
+            boot_clear(sx0, sy0, sx1, sy1);
+            cx0 = sx0; cy0 = sy0; cx1 = sx1; cy1 = sy1;
+            draw_spinner(W * 0.5, H * 0.5, fmax(16.0, H * 0.032), rot);
+
+            boot_clear(fx0, fy0, fx1, fy1);
+            cx0 = fx0; cy0 = fy0; cx1 = fx1; cy1 = fy1;
+            draw_fps(0);
+
+            blit_rect(lx0, ly0, lx1, ly1);
+            blit_rect(sx0, sy0, sx1, sy1);
+            blit_rect(fx0, fy0, fx1, fy1);
+            clip_full();
         }
 
-        if (st == ST_WALL)
-            pump_mouse();
-        in_desktop = (st == ST_WALL);
-
-        /* compose frame */
-        for (size_t i = 0; i < (size_t)W * H; i++)
-            back[i] = 0;
-
-        int nl = reveal_n < DISPLAY_LINES ? reveal_n : DISPLAY_LINES;
-        int first = reveal_n - nl;
-        int ty = H - LOG_MARGIN - nl * FONT_H;
-        for (int i = 0; i < nl; i++)
-            draw_text(LOG_MARGIN, ty + i * FONT_H, hist[first + i].text,
-                      rgb(LOG_R, LOG_G, LOG_B));
-
-        draw_spinner(W * 0.5, H * 0.5, fmax(16.0, H * 0.032), rot);
-
-        if (st == ST_FADE && desktop) {
-            double a = (t - fade0) / FADE_SECONDS;
-            if (a >= 1.0) {
-                st = ST_WALL;
-                blend_tex(desktop, 256);
-            } else {
-                a = a * a * (3 - 2 * a);          /* smoothstep easing */
-                blend_tex(desktop, (int)(a * 256.0 + 0.5));
+        if (st == ST_FADE) {
+            /* full-frame compose: log + spinner over fading desktop */
+            clip_full();
+            memset(back, 0, (size_t)W * H * 4);
+            draw_log_lines();
+            draw_spinner(W * 0.5, H * 0.5, fmax(16.0, H * 0.032), rot);
+            if (desktop) {
+                double a = (t - fade0) / FADE_SECONDS;
+                if (a >= 1.0) {
+                    st = ST_WALL;
+                    scene_invalid = true;
+                    memcpy(back, desktop, (size_t)W * H * 4);
+                } else {
+                    a = a * a * (3 - 2 * a);      /* smoothstep easing */
+                    int A = (int)(a * 256.0 + 0.5);
+                    for (size_t i = 0; i < (size_t)W * H; i++) {
+                        uint32_t v = back[i], w = desktop[i];
+                        unsigned r = ((v >> 16 & 255) * (256 - A) + (w >> 16 & 255) * A) >> 8;
+                        unsigned g = ((v >>  8 & 255) * (256 - A) + (w >>  8 & 255) * A) >> 8;
+                        unsigned b = ((v       & 255) * (256 - A) + (w       & 255) * A) >> 8;
+                        back[i] = rgb(r, g, b);
+                    }
+                }
             }
-        } else if (st == ST_WALL && desktop) {
-            memcpy(back, desktop, (size_t)W * H * 4);
+            draw_fps(0);
+            blit_rect(0, 0, W - 1, H - 1);
         }
 
-        if (st == ST_WALL && desktop)
-            draw_menu();
+        if (st == ST_WALL) {
+            in_desktop = true;
+            pmx = mx; pmy = my;
+            pump_mouse();
+            pump_keyboard();
+            if (keyq_n > 0 && sh_fd >= 0) {
+                term_write(keyq, keyq_n);
+                keyq_n = 0;
+            } else if (keyq_n > 0) {
+                keyq_n = 0;
+            }
+            dock_update(dt);
 
-        draw_fps(st == ST_BOOT ? 0 : 1);
+            /* menu dropdown animation */
+            if (menu_open) {
+                menu_a += dt / MENU_MS;
+                if (menu_a >= 1.0) { menu_a = 1.0; menu_closing = false; }
+            } else if (menu_closing) {
+                menu_a -= dt / MENU_MS;
+                if (menu_a <= 0.0) { menu_a = 0.0; menu_closing = false; }
+            }
 
-        if (st == ST_WALL)
-            draw_cursor();
+            /* caret blink */
+            if (tm == TM_OPEN && !tm_anim && sh_fd >= 0) {
+                bool on = fmod(t, 1.06) < 0.53;
+                if (on != caret_on) {
+                    caret_on = on;
+                    term_dirty = true;
+                }
+            }
+            anim_update();
+            term_poll();
 
-        blit();
+            /* re-render the window texture when the terminal produced output
+             * or the caret blinked (only in a stable, visible state) */
+            if (term_dirty && !tm_anim && tm == TM_OPEN) {
+                int a, b, c, d, al;
+                if (win_cur_rect(&a, &b, &c, &d, &al))
+                    render_winbuf(c - a + 1, d - b + 1);
+            }
+
+            /* ---------- dirty rect collection ---------- */
+            drn = 0;
+            if (scene_invalid || force_full) {
+                add_rect(0, 0, W - 1, H - 1);
+                force_full = false;
+            } else {
+                if (force_dirty) {
+                    int m = (int)(44 * u);
+                    add_rect(force_x0 - m, force_y0 - m, force_x1 + m, force_y1 + m);
+                    force_dirty = false;
+                }
+                /* cursor: cover old and new position; for teleports (fast
+                 * multi-packet moves) repaint the whole frame once — cheap
+                 * and guarantees no ghost trails */
+                if (abs(mx - pmx) > 50 || abs(my - pmy) > 50) {
+                    force_full = true;
+                } else {
+                    int ax0 = pmx < mx ? pmx : mx;
+                    int ay0 = pmy < my ? pmy : my;
+                    int ax1 = pmx > mx ? pmx : mx;
+                    int ay1 = pmy > my ? pmy : my;
+                    add_rect(ax0 - 4, ay0 - 4, ax1 + cur_w + 4, ay1 + cur_h + 4);
+                }
+
+                int fx0, fy0, fx1, fy1;
+                fps_bbox(&fx0, &fy0, &fx1, &fy1);
+                add_rect(fx0, fy0, fx1, fy1);
+
+                /* menu */
+                bool hover = in_rect(mx, my, ti_x0, ti_y0, ti_x1, ti_y1);
+                static bool hover_prev = false;
+                if (menu_open || menu_a > 0.001 || menu_closing || hover != hover_prev) {
+                    add_rect(ti_x0 - 2, ti_y0, ti_x1 + 2, ti_y1);
+                    if (menu_a > 0.001) {
+                        double e = menu_a * menu_a * (3 - 2 * menu_a);
+                        int oy = (int)((1.0 - e) * -14 * u);
+                        add_rect(dd_x0 - 4, dd_y0 + oy - 6, dd_x1 + 6, dd_y1 + 8);
+                    }
+                }
+                hover_prev = hover;
+
+                /* dock icon magnification / running dot */
+                bool dot_on = tm != TM_CLOSED;
+                if (fabs(icon_s - icon_s_drawn) > 0.002 || dot_on != dock_dot_drawn) {
+                    int ix0, iy0, ix1, iy1;
+                    icon_rect(fmax(icon_s, icon_s_drawn), &ix0, &iy0, &ix1, &iy1);
+                    add_rect(ix0 - 4, iy0 - 4, ix1 + 4, ddy1 + 2);
+                    icon_s_drawn = icon_s;
+                    dock_dot_drawn = dot_on;
+                }
+
+                /* terminal window */
+                if ((tm != TM_CLOSED && tm != TM_MINIMIZED) || tm_anim) {
+                    int a, b, c, d, al;
+                    if (win_cur_rect(&a, &b, &c, &d, &al)) {
+                        int m = (int)(40 * u);
+                        if (tm_anim) {
+                            add_rect(A_fx0 - m, A_fy0 - m, A_fx1 + m, A_fy1 + m);
+                            add_rect(A_tx0 - m, A_ty0 - m, A_tx1 + m, A_ty1 + m);
+                        } else {
+                            static int px0 = -1, py0 = -1, px1 = -1, py1 = -1;
+                            if (term_dirty ||
+                                a != px0 || b != py0 || c != px1 || d != py1) {
+                                add_rect(a - m, b - m, c + m, d + m);
+                                px0 = a; py0 = b; px1 = c; py1 = d;
+                            }
+                            if (mx >= a - 4 && mx <= c + 4 && my >= b - 4 && my <= d + 4 &&
+                                (mx != pmx || my != pmy))
+                                add_rect(a - m, b - m, c + m, d + m);
+                        }
+                        term_dirty = false;
+                    }
+                }
+            }
+            scene_invalid = false;
+
+            for (int i = 0; i < drn; i++)
+                scene_render(dr[i].x0, dr[i].y0, dr[i].x1, dr[i].y1);
+        }
 
         if (!ready) {
             int fd = open(READY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);

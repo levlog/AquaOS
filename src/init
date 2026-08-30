@@ -15,6 +15,14 @@ mount -t devpts devpts /dev/pts 2>/dev/null
 # Start the splash as early as possible (it waits for /dev/fb0 itself).
 /usr/bin/splash &
 
+# evdev: input event device layer for the AT keyboard (atkbd is built-in);
+# load BEFORE 'mdev -s' so /dev/input/event0 is created by the coldplug scan
+if [ -f /lib/modules/evdev.ko ]; then
+    insmod /lib/modules/evdev.ko 2>/dev/null \
+        && echo "AquaOS init: evdev loaded (keyboard events)" > /dev/kmsg \
+        || echo "AquaOS init: evdev failed to load" > /dev/kmsg
+fi
+
 # Real device enumeration.
 mdev -s
 echo "AquaOS init: device nodes populated" > /dev/kmsg
