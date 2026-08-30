@@ -1,0 +1,60 @@
+#!/bin/busybox sh
+# AquaOS init (PID 1).
+# Performs the real boot sequence and drives the splash.
+# Every log line is a real event; every reported value is read from the system.
+
+/bin/busybox --install -s
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm /run /tmp
+mount -t devpts devpts /dev/pts 2>/dev/null
+
+# Start the splash as early as possible (it waits for /dev/fb0 itself).
+/usr/bin/splash &
+
+# Real device enumeration.
+mdev -s
+echo "AquaOS init: device nodes populated" > /dev/kmsg
+echo "AquaOS init: kernel $(uname -r) on $(uname -m)" > /dev/kmsg
+
+# Real system information, straight from the kernel.
+CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
+MEM=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+echo "AquaOS init: cpu: ${CPU:-unknown}" > /dev/kmsg
+echo "AquaOS init: memory: ${MEM:-?} MiB total (from /proc/meminfo)" > /dev/kmsg
+
+# Fallback: if the firmware framebuffer did not appear, try KMS drivers.
+if [ ! -e /dev/fb0 ]; then
+    echo "AquaOS init: no firmware framebuffer, loading KMS display driver" > /dev/kmsg
+    modprobe simpledrm 2>/dev/null
+    modprobe bochs-drm 2>/dev/null
+fi
+
+# Wait until the splash has rendered its first frame (real readiness signal).
+i=0
+while [ $i -lt 200 ]; do
+    [ -e /run/splash.ready ] && break
+    sleep 0.1
+    i=$((i + 1))
+done
+
+# Short dwell so the boot log and spinner stay visible, then finish the boot.
+sleep 3
+
+echo "AquaOS init: boot complete" > /dev/kmsg
+echo "AquaOS init: showing desktop wallpaper" > /dev/kmsg
+: > /run/bootdone
+
+# Debug channel: dump the full kernel log to serial when 'aquadebug' is set.
+if grep -q aquadebug /proc/cmdline 2>/dev/null; then
+    setsid sh -c 'exec cat /dev/kmsg > /dev/ttyS0 2>&1' &
+fi
+
+# Recovery console on VT2 (invisible on the framebuffer; Ctrl-Alt-F2 to reach).
+while :; do
+    sh -c 'exec sh </dev/tty2 >/dev/tty2 2>&1'
+    sleep 1
+done

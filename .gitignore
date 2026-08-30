@@ -1,0 +1,5 @@
+build/
+tools/
+*.o
+*.raw
+font.h

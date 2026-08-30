@@ -1,0 +1,129 @@
+# AquaOS — инструкция
+
+Настоящая загружаемая операционная система (ISO) с графическим сплэшем и панелью в стиле macOS.
+
+Это не веб-страница и не симуляция: в ISO лежит настоящее ядро Linux 6.12, собственный init-процесс (PID 1) и самописная графическая оболочка, рисующая прямо во фреймбуфер `/dev/fb0`.
+
+> **Внимание:** текущая сборка использует временную обоину-плейсхолдер (оригинал `background_default.jpg` был утерян при сбросе воркспейса). Перекинь файл обоев в чат ещё раз — пересоберу с ним за пару минут.
+
+---
+
+## 1. Что происходит при загрузке
+
+| Этап | Что видно |
+|------|-----------|
+| 0–2 c | GRUB (скрытое меню, 1 c — ESC открывает меню) передаёт управление ядру |
+| старт ядра | Экран чёрный. В **нижнем левом углу бегут реальные логи ядра** (из `/dev/kmsg`, с настоящими таймстампами) |
+| старт сплэша | В **центре — маленький белый круговой спиннер** (macOS-стиль, 60 fps), в **правом верхнем углу появляется счётчик FPS** |
+| init завершил работу | **Плавный кроссфейд 1.4 с** — экран загрузки растворяется в рабочем столе |
+| рабочий стол | Обои + **пустая панель сверху в стиле macOS** (menu bar): «матовое стекло» из заблюренных обоев, осветление, тонкая линия снизу. FPS продолжает тикать справа вверху |
+
+**Все данные настоящие:**
+- логи в углу — реальные сообщения ядра (`/dev/kmsg`);
+- `cpu:` / `memory:` — из `/proc/cpuinfo` и `/proc/meminfo`;
+- **FPS — реальный замер**: считаются кадры, действительно отрисованные сплэшем, окно усреднения 0.5 с, число обновляется дважды в секунду. Под TCG-эмуляцией будет ~20–59, с WHPX/KVM — стабильные ~60. Пока первое окно замера не завершилось, цифра не рисуется (никаких «0 FPS»-заглушек).
+
+## 2. Как запустить в QEMU (Windows)
+
+```cmd
+"C:\Program Files\qemu\qemu-system-x86_64.exe" -m 2048 -cdrom "%USERPROFILE%\Downloads\AquaOS.iso" -vga std
+```
+
+С ускорением (если включён Windows Hypervisor Platform):
+
+```cmd
+"C:\Program Files\qemu\qemu-system-x86_64.exe" -m 2048 -cdrom "%USERPROFILE%\Downloads\AquaOS.iso" -vga std -accel whpx
+```
+
+На Linux: `qemu-system-x86_64 -m 2048 -cdrom AquaOS.iso -enable-kvm -vga std`. ISO гибридный (можно `dd` на USB).
+
+## 3. Архитектура
+
+```
+ISO (El Torito BIOS + isohybrid, xorriso)
+├── boot/grub/boot_grub.img   ← GRUB core (grub-mkimage): iso9660, gfxterm, linux…
+├── boot/grub/grub.cfg        ← gfxmode 1024x768x32, gfxpayload=keep, loglevel=0
+└── boot/initrd.gz            ← initramfs (cpio+gzip):
+    ├── /init                 ← PID 1 (busybox sh)
+    ├── /bin/busybox          ← static
+    ├── /usr/bin/splash       ← графическая оболочка (статический C-бинарник)
+    └── /usr/share/splash/wallpaper.raw  ← обои 1024x768 RGB
+```
+
+- Режим видео ставит GRUB (1024x768x32), ядро подхватывает через VESA-fb — модули ядра не нужны.
+- `loglevel=0` прячет текст ядра с экрана, сплэш читает полный журнал из `/dev/kmsg`.
+- Панель готовится один раз при старте: полоса обоев → box blur (гориз. 14 px + верт. 3 px) → осветление белым 58% → hairline. Потом просто блитится.
+- Рендер-луп работает на 60 FPS постоянно (в отличие от первой версии, обои теперь перерисовываются каждый кадр — поэтому FPS честный).
+
+## 4. Состав проекта
+
+| Файл | Назначение |
+|------|-----------|
+| `src/splash.c` | Оболочка: логи kmsg, спиннер, кроссфейд, панель macOS, FPS-счётчик |
+| `src/init` | PID 1: монтирование ФС, mdev, инфо о CPU/RAM, сигнал bootdone |
+| `src/build.sh` | Полная сборка: шрифт → обои → splash → initramfs → GRUB → ISO |
+| `src/mkfont.py` | Генерирует `font.h` (глифы 8x16 из DejaVu Sans Mono / PSF) |
+| `src/mkwallpaper.py` | Обои jpg → raw RGB 1024x768 (cover-crop) |
+| `src/test_qemu.py` | Автотест: QEMU headless + скриншоты по таймингам |
+| `tools_setup.sh` | Скачивает и распаковывает инструменты БЕЗ root (dpkg -x) |
+| `assets/wallpaper.jpg` | Текущая обоина (плейсхолдер) |
+| `iso/AquaOS.iso` | Последняя собранная ISO (в репозитории GitHub) |
+| `screenshots/` | Скриншоты загрузки и рабочего стола |
+
+Все скрипты используют пути относительно своего расположения — репозиторий можно клонировать куда угодно.
+
+## 5. Как пересобрать
+
+Без root (как здесь): `./tools_setup.sh` → `./build.sh` (или `DEBUG=1 ./build.sh`).
+С root (Debian/Ubuntu): `apt install build-essential busybox-static grub-pc-bin grub-common xorriso cpio python3-pil linux-image-amd64` и собрать аналогично.
+
+Собрать с другой обоей: `WALLPAPER=/путь/к/картинке.jpg ./build.sh`
+
+## 6. Настройка (константы в начале `splash.c`)
+
+- `FADE_SECONDS` — длительность кроссфейда (1.4 с)
+- `SPIN_PERIOD` — секунд на оборот спиннера (1.25)
+- `FPS_WINDOW` — окно усреднения FPS (0.5 с)
+- Высота панели: `H * 0.036` (мин. 24 px) в `build_desktop()`
+- Осветление панели: множители `107 / 148` (58% белого) в `build_desktop()`
+- Dwell экрана загрузки: `sleep 3` в `init`
+
+## 7. Скрытые возможности
+
+- **Recovery-консоль**: Ctrl-Alt-F2 — busybox sh (не виден на фреймбуфере).
+- **Отладочный ISO**: `DEBUG=1 ./build.sh` пишет весь kmsg в COM1 (`-serial file:boot.log`).
+
+## 8. Идеи следующих шагов
+
+Док снизу (иконки, увеличение при наведении), часы в панели, курсор мыши (ps2/virtio → собственный курсор), меню , UEFI-загрузка, окна/композитинг — фундамент готов: есть постоянный рендер-луп на 60 FPS и текстура рабочего стола.
+
+## 9. Бэкап на GitHub
+
+Проект упакован в два артефакта (лежат рядом с этой инструкцией):
+
+- **`aquaos.bundle`** — git-bundle: полный репозиторий с историей в одном файле. Восстановление:
+  ```cmd
+  git clone aquaos.bundle AquaOS
+  ```
+- **`aquaos-backup.zip`** — то же самое обычным архивом (без истории git).
+
+### Вариант А: заливает ассистент (нужен токен)
+
+1. Создай на github.com **пустой приватный репозиторий** (например, `AquaOS`): New repository → Private → без README/.gitignore.
+2. GitHub → Settings → Developer settings → **Personal access tokens → Fine-grained tokens** → Generate new token:
+   - Repository access: **Only select repositories** → `AquaOS`;
+   - Permissions → Contents: **Read and write**;
+   - Expiration: 7 дней (или меньше).
+3. Пришли токен в чат — ассистент сделает `git push` и подтвердит.
+4. После заливки токен можно отозвать (Settings → Fine-grained tokens → Delete).
+
+Токен с такими правами даёт доступ **только к этому одному репозиторию и на ограниченный срок** — риск минимальный, но после использования его всё равно стоит удалить.
+
+### Вариант Б: залить самому
+
+```cmd
+git clone aquaos.bundle AquaOS
+cd AquaOS
+git remote set-url origin https://github.com/ТВОЙ_НИК/AquaOS.git
+git push -u origin main
+```
