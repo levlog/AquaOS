@@ -33,6 +33,15 @@ mkdir -p "$RM"/bin "$RM"/usr/bin "$RM"/usr/share/splash "$RM"/proc "$RM"/sys "$R
 cp "$P/usr/bin/busybox" "$RM/bin/busybox"
 cp "$BUILD/splash" "$RM/usr/bin/splash"
 cp "$BUILD/wallpaper.raw" "$RM/usr/share/splash/wallpaper.raw"
+
+# PS/2 mouse driver (busybox insmod cannot read .xz, so unpack it here)
+mkdir -p "$RM/lib/modules"
+KMOD="$P/usr/lib/modules/$KVER/kernel/drivers/input/mouse/psmouse.ko.xz"
+if [ -f "$KMOD" ]; then
+    unxz -c "$KMOD" > "$RM/lib/modules/psmouse.ko"
+else
+    echo "WARN: psmouse.ko.xz not found - mouse will not work"
+fi
 install -m 0755 "$SRC/init" "$RM/init"
 ( cd "$RM" && find . -print0 | cpio --null -o -H newc --quiet | gzip -9 > "$BUILD/initrd.gz" )
 ls -la "$BUILD/initrd.gz"

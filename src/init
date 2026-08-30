@@ -20,6 +20,13 @@ mdev -s
 echo "AquaOS init: device nodes populated" > /dev/kmsg
 echo "AquaOS init: kernel $(uname -r) on $(uname -m)" > /dev/kmsg
 
+# PS/2 mouse: i8042 + mousedev are built-in, psmouse is a module.
+if [ -f /lib/modules/psmouse.ko ]; then
+    insmod /lib/modules/psmouse.ko 2>/dev/null \
+        && echo "AquaOS init: psmouse loaded (PS/2 mouse)" > /dev/kmsg \
+        || echo "AquaOS init: psmouse failed to load" > /dev/kmsg
+fi
+
 # Real system information, straight from the kernel.
 CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
 MEM=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
