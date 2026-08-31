@@ -42,6 +42,7 @@
 
 #include "font.h"
 #include "terminal_icon.h"
+#include "drop_icon.h"
 
 /* ---------------- tuning ------------------------------------------- */
 #define WALL_PATH        "/usr/share/splash/wallpaper.raw"
@@ -65,8 +66,9 @@
 #define DOCK_MARGIN_B    7       /* dock gap from the bottom edge, px   */
 #define CURSOR_W         13      /* arrow cursor sprite, px (scaled)    */
 #define CURSOR_H         19
-#define ICON_BASE        60      /* dock icon size, unit-px             */
-#define DOCK_W           280     /* dock width, unit-px                 */
+#define ICON_BASE        56      /* dock icon size, unit-px             */
+#define DOCK_W           240     /* dock width, unit-px                 */
+#define WIN_R            10      /* terminal window corner radius, px   */
 #define TERM_TITLE       "Terminal - sh"
 #define TERM_DONE        "Done - sh"
 
@@ -100,7 +102,6 @@ static inline bool in_clip(int x, int y)
 }
 
 /* UI scales */
-static int fs;            /* UI font scale: 1 or 2                     */
 static double u;          /* linear unit scale, H/768                  */
 
 /* mouse / menu / cursor state */
@@ -159,11 +160,10 @@ static int fb_open(void)
         return -1;
     fast32 = (BPP == 4 && rf.offset == 16 && gf.offset == 8 && bf.offset == 0 &&
               rf.length == 8 && gf.length == 8 && bf.length == 8);
-    fs = H >= 1000 ? 2 : 1;
-    u = (double)H / 768.0;
+    u = (double)H / 1080.0;    /* UI metrics are authored at 1080p */
     clip_full();
-    fprintf(stderr, "splash: fb0 %dx%d %dbpp (fast32=%d, fs=%d, u=%.3f)\n",
-            W, H, BPP * 8, fast32, fs, u);
+    fprintf(stderr, "splash: fb0 %dx%d %dbpp (fast32=%d, 1=%d, u=%.3f)\n",
+            W, H, BPP * 8, fast32, 1, u);
     return 0;
 }
 
@@ -365,6 +365,18 @@ static double sd_round(double px, double py,
     return sqrt(ax * ax + ay * ay) + fmin(fmax(qx, qy), 0.0) - r;
 }
 
+/* distance from a point to a line segment (for vector overlays) */
+static double seg_dist(double px, double py,
+                       double ax, double ay, double bx, double by)
+{
+    double vx = bx - ax, vy = by - ay;
+    double t = ((px - ax) * vx + (py - ay) * vy) / (vx * vx + vy * vy);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    double dx = px - (ax + t * vx), dy = py - (ay + t * vy);
+    return sqrt(dx * dx + dy * dy);
+}
+
 /* ---------------- terminal window geometry & textures ------------------ */
 static int ww, wh, wx, wy;        /* terminal window target rect (normal) */
 static int tw_title;              /* title bar height                     */
@@ -387,7 +399,7 @@ static bool caret_on = true;      /* caret blink phase                    */
 /* ---------------- desktop panel --------------------------------------- */
 static void build_desktop(void)
 {
-    panel_h = (int)fmax(26.0, H * 0.050);
+    panel_h = (int)fmax(30.0, H * 0.037);
     if (panel_h > H / 4)
         panel_h = H / 4;
     desktop = malloc((size_t)W * H * 4);
@@ -431,9 +443,9 @@ static void build_desktop(void)
     }
 
     /* ---- dock: frosted dark-glass bar at the bottom, macOS-style ---- */
-    dock_h = (int)(ICON_BASE * u) + (int)(20 * u);
-    if (dock_h < 52)
-        dock_h = 52;
+    dock_h = (int)(ICON_BASE * u) + (int)(16 * u);
+    if (dock_h < 48)
+        dock_h = 48;
     if (dock_h > H / 5)
         dock_h = H / 5;
     int dock_w = (int)(DOCK_W * u);
@@ -503,12 +515,12 @@ static void build_desktop(void)
     free(s4);
 
     /* ---- terminal window geometry + frosted backdrop ---- */
-    ww = W * 46 / 100;
-    wh = H * 56 / 100;
+    ww = W * 44 / 100;
+    wh = H * 54 / 100;
     if (ww > W - 80) ww = W - 80;
     if (wh > H - panel_h - dock_h - 60) wh = H - panel_h - dock_h - 60;
     wx = (W - ww) / 2;
-    wy = panel_h + (int)(30 * u);
+    wy = panel_h + (int)(24 * u);
     tw_title = (int)(30 * u);
     if (tw_title < 26)
         tw_title = 26;
@@ -629,30 +641,33 @@ static bool in_rect(int x, int y, int x0, int y0, int x1, int y1)
 }
 
 /* ---------------- drawing primitives (clipped) ------------------------- */
+/* glyph pixels carry 8-bit alpha coverage (anti-aliased TTF raster) */
 static void draw_char_s(int x, int y, char ch, uint32_t col, int s)
 {
+    (void)s;
     if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
         return;
-    const unsigned char *gl = FONT_BITMAP[ch - FONT_FIRST];
+    const unsigned char (*gl)[FONT_W] =
+        (const unsigned char (*)[FONT_W])FONT_BITMAP[ch - FONT_FIRST];
+    int cr = col >> 16 & 255, cg = col >> 8 & 255, cb = col & 255;
     for (int ry = 0; ry < FONT_H; ry++) {
-        unsigned char rowb = gl[ry];
-        if (!rowb)
+        int py = y + ry;
+        if (py < cy0 || py > cy1)
             continue;
+        const unsigned char *row = gl[ry];
+        uint32_t *d = back + (size_t)py * W;
         for (int rx = 0; rx < FONT_W; rx++) {
-            if (!(rowb & (0x80 >> rx)))
+            int a = row[rx];
+            if (!a)
                 continue;
-            for (int by = 0; by < s; by++) {
-                int py = y + ry * s + by;
-                if (py < cy0 || py > cy1)
-                    continue;
-                uint32_t *d = back + (size_t)py * W;
-                for (int bx = 0; bx < s; bx++) {
-                    int px = x + rx * s + bx;
-                    if (px < cx0 || px > cx1)
-                        continue;
-                    d[px] = col;
-                }
-            }
+            int px = x + rx;
+            if (px < cx0 || px > cx1)
+                continue;
+            uint32_t ob = d[px];
+            unsigned rr = ((ob >> 16 & 255) * (255 - a) + cr * a) / 255;
+            unsigned gg = ((ob >>  8 & 255) * (255 - a) + cg * a) / 255;
+            unsigned bb = ((ob       & 255) * (255 - a) + cb * a) / 255;
+            d[px] = rgb(rr, gg, bb);
         }
     }
 }
@@ -788,66 +803,86 @@ static void draw_spinner(double ccx, double ccy, double R, double rot)
 }
 
 /* ---------------- cursor ------------------------------------------------ */
-/* classic white arrow with black outline ('X' = outline, 'W' = fill);
- * drawn at 1x or 2x integer scale so it stays crisp */
-static const char *CURSOR_MAP[CURSOR_H] = {
-    "X............",
-    "XX...........",
-    "XWX..........",
-    "XWWX.........",
-    "XWWWX........",
-    "XWWWWX.......",
-    "XWWWWWX......",
-    "XWWWWWWX.....",
-    "XWWWWWWWX....",
-    "XWWWWWWWWX...",
-    "XWWWWWWWWWX..",
-    "XWWWWWWWWWWX.",
-    "XWWWWXXXXXX..",
-    "XWWXWWX......",
-    "XWX.XWWX.....",
-    "XX..XWWX.....",
-    "X....XWWX....",
-    "......XWWX...",
-    ".......XX...."
-};
-static int cur_s;                 /* cursor scale (1 or 2)                */
-static int cur_w, cur_h;          /* scaled cursor size                   */
+/* macOS-style black arrow with a thin white outline, rasterized from a
+ * polygon with 4x supersampling for perfectly smooth edges */
+static unsigned char *cur_alpha_w, *cur_alpha_b;   /* outline / body       */
+static int cur_w, cur_h;
 
 static void cursor_init(void)
 {
-    cur_s = H >= 1000 ? 2 : 1;
-    cur_w = CURSOR_W * cur_s;
-    cur_h = CURSOR_H * cur_s;
+    const double P[][2] = {
+        { 0.0, 0.0 }, { 0.0, 16.2 }, { 3.18, 13.1 }, { 5.33, 18.4 },
+        { 7.11, 17.6 }, { 4.89, 12.4 }, { 9.33, 12.4 },
+    };
+    const int NP = (int)(sizeof(P) / sizeof(P[0]));
+    const double SC = 1.55;
+    cur_w = (int)ceil(9.33 * SC) + 2;
+    cur_h = (int)ceil(18.4 * SC) + 2;
+    cur_alpha_w = calloc((size_t)cur_w * cur_h, 1);
+    cur_alpha_b = calloc((size_t)cur_w * cur_h, 1);
+    const int SS = 4;
+    for (int py = 0; py < cur_h; py++) {
+        for (int px = 0; px < cur_w; px++) {
+            int aw = 0, ab = 0;
+            for (int sy = 0; sy < SS; sy++) {
+                for (int sx = 0; sx < SS; sx++) {
+                    double x = (px + (sx + 0.5) / SS - 1.0) / SC;
+                    double y = (py + (sy + 0.5) / SS - 1.0) / SC;
+                    int inside = 0;
+                    for (int i = 0, j = NP - 1; i < NP; j = i++) {
+                        if ((P[i][1] > y) != (P[j][1] > y) &&
+                            x < (P[j][0] - P[i][0]) * (y - P[i][1]) /
+                                (P[j][1] - P[i][1]) + P[i][0])
+                            inside = !inside;
+                    }
+                    double d = 1e9;
+                    for (int i = 0, j = NP - 1; i < NP; j = i++)
+                        d = fmin(d, seg_dist(x, y, P[i][0], P[i][1],
+                                             P[j][0], P[j][1]));
+                    if (inside) {
+                        ab++;
+                        if (d * SC <= 1.35)
+                            aw++;            /* outline melts into body */
+                    } else if (d * SC <= 0.9) {
+                        aw++;
+                    }
+                }
+            }
+            cur_alpha_w[(size_t)py * cur_w + px] =
+                (unsigned char)(aw * 255 / (SS * SS));
+            cur_alpha_b[(size_t)py * cur_w + px] =
+                (unsigned char)(ab * 255 / (SS * SS));
+        }
+    }
 }
 
 static void draw_cursor(void)
 {
-    for (int pass = 0; pass < 2; pass++) {    /* 0: soft shadow, 1: arrow */
-        int ox = mx + (pass ? 0 : cur_s), oy = my + (pass ? 0 : cur_s);
-        for (int r = 0; r < CURSOR_H; r++) {
-            for (int c = 0; c < CURSOR_W; c++) {
-                char ch = CURSOR_MAP[r][c];
-                if (ch == '.')
-                    continue;
-                int v = pass ? (ch == 'X' ? 0 : 255) : 0;
-                int A = pass ? 255 : 110;
-                for (int by = 0; by < cur_s; by++) {
-                    int py = oy + r * cur_s + by;
-                    if (py < 0 || py >= H)
-                        continue;
-                    for (int bx = 0; bx < cur_s; bx++) {
-                        int px = ox + c * cur_s + bx;
-                        if (px < 0 || px >= W)
-                            continue;
-                        uint32_t ob = back[(size_t)py * W + px];
-                        int rr = ((ob >> 16 & 255) * (255 - A) + v * A) / 255;
-                        int gg = ((ob >>  8 & 255) * (255 - A) + v * A) / 255;
-                        int bb = ((ob       & 255) * (255 - A) + v * A) / 255;
-                        back[(size_t)py * W + px] = rgb(rr, gg, bb);
-                    }
-                }
+    for (int r = 0; r < cur_h; r++) {
+        int py = my + r;
+        if (py < 0 || py >= H)
+            continue;
+        for (int c = 0; c < cur_w; c++) {
+            int px = mx + c;
+            if (px < 0 || px >= W)
+                continue;
+            int aw = cur_alpha_w[(size_t)r * cur_w + c];
+            int ab = cur_alpha_b[(size_t)r * cur_w + c];
+            if (!aw && !ab)
+                continue;
+            uint32_t ob = back[(size_t)py * W + px];
+            unsigned rr = ob >> 16 & 255, gg = ob >> 8 & 255, bb = ob & 255;
+            if (aw) {                          /* white outline */
+                rr = (rr * (255 - aw) + 255 * aw) / 255;
+                gg = (gg * (255 - aw) + 255 * aw) / 255;
+                bb = (bb * (255 - aw) + 255 * aw) / 255;
             }
+            if (ab) {                          /* black body on top */
+                rr = (rr * (255 - ab)) / 255;
+                gg = (gg * (255 - ab)) / 255;
+                bb = (bb * (255 - ab)) / 255;
+            }
+            back[(size_t)py * W + px] = rgb(rr, gg, bb);
         }
     }
 }
@@ -882,10 +917,11 @@ static void draw_fps(int dark)
 /* ---------------- menu bar --------------------------------------------- */
 static void menu_geometry(void)
 {
-    int tw = (int)strlen(MENU_TITLE) * font_w_s(fs);
-    ti_x0 = MENU_X - 8;
+    int tx = MENU_X + 28;                     /* drop icon (24) + gap    */
+    int tw = (int)strlen("Settings") * FONT_W;
+    ti_x0 = tx - 8;
     ti_y0 = 0;
-    ti_x1 = MENU_X + tw + 7;
+    ti_x1 = tx + tw + (int)(17 * u) + 5;      /* text + chevron          */
     ti_y1 = panel_h - 1;
     dd_x0 = MENU_X - 8;
     dd_y0 = panel_h + 2;
@@ -897,13 +933,58 @@ static void menu_geometry(void)
     it_y1 = it_y0 + (int)(40 * u);
 }
 
+/* draw an arbitrary RGBA icon (premultiplied-less, straight alpha) */
+static void draw_icon_rgba(const unsigned char *data, int iw, int ih,
+                           int x, int y, int size);
+
+/* small anti-aliased chevron pointing down (~9x6 px) */
+static void draw_chevron(int x, int y, uint32_t col)
+{
+    const int SS = 3;
+    double th = 0.95;                          /* half stroke width      */
+    for (int py = 0; py < 7; py++) {
+        int yy = y + py;
+        if (yy < cy0 || yy > cy1)
+            continue;
+        for (int px = 0; px < 10; px++) {
+            int xx = x + px;
+            if (xx < cx0 || xx > cx1)
+                continue;
+            int cov = 0;
+            for (int sy = 0; sy < SS; sy++)
+                for (int sx = 0; sx < SS; sx++) {
+                    double fx = px + (sx + 0.5) / SS;
+                    double fy = py + (sy + 0.5) / SS;
+                    double d1 = seg_dist(fx, fy, 0.4, 0.6, 4.5, 5.2);
+                    double d2 = seg_dist(fx, fy, 4.5, 5.2, 8.6, 0.6);
+                    if (fmin(d1, d2) <= th)
+                        cov++;
+                }
+            if (!cov)
+                continue;
+            int a = cov * 255 / (SS * SS);
+            uint32_t ob = back[(size_t)yy * W + xx];
+            unsigned rr = ((ob >> 16 & 255) * (255 - a) + (col >> 16 & 255) * a) / 255;
+            unsigned gg = ((ob >>  8 & 255) * (255 - a) + (col >>  8 & 255) * a) / 255;
+            unsigned bb = ((ob       & 255) * (255 - a) + (col       & 255) * a) / 255;
+            back[(size_t)yy * W + xx] = rgb(rr, gg, bb);
+        }
+    }
+}
+
 static void draw_menu_animated(void)
 {
     bool hov = in_rect(mx, my, ti_x0, ti_y0, ti_x1, ti_y1);
+    /* drop icon at the logo position (never highlighted) */
+    draw_icon_rgba(DROP_ICON_DATA, DROP_ICON_W, DROP_ICON_H,
+                   MENU_X - 2, (panel_h - (int)(22 * u)) / 2, (int)(22 * u));
     if (menu_open || hov)
         paint_round(ti_x0, ti_y0, ti_x1, ti_y1, 5, rgb(10, 122, 255), 256, 0);
-    draw_text_s(MENU_X, (panel_h - font_h_s(fs)) / 2, MENU_TITLE,
-                (menu_open || hov) ? rgb(255, 255, 255) : rgb(28, 28, 30), fs);
+    draw_text_s(MENU_X + 28, (panel_h - font_h_s(1)) / 2, "Settings",
+                (menu_open || hov) ? rgb(255, 255, 255) : rgb(28, 28, 30), 1);
+    draw_chevron(MENU_X + 28 + (int)strlen("Settings") * FONT_W + 5,
+                 (panel_h - 7) / 2,
+                 (menu_open || hov) ? rgb(255, 255, 255) : rgb(70, 70, 75));
     if (menu_a <= 0.003)
         return;
 
@@ -925,28 +1006,29 @@ static void draw_menu_animated(void)
     if (ah)
         paint_round(it_x0, iy0, it_x1, iy1, 5, rgb(10, 122, 255), alpha, 0);
     draw_text_s(it_x0 + (int)(10 * u),
-                iy0 + (it_y1 - it_y0 - font_h_s(fs)) / 2, "About",
-                ah ? rgb(255, 255, 255) : rgb(28, 28, 30), fs);
+                iy0 + (it_y1 - it_y0 - font_h_s(1)) / 2, "About",
+                ah ? rgb(255, 255, 255) : rgb(28, 28, 30), 1);
 }
 
 /* ---------------- dock icons -------------------------------------------- */
-/* draw the terminal icon (RGBA) with nearest sampling and alpha blending */
-static void draw_icon_rgba(int x, int y, int size)
+/* draw an RGBA icon with nearest sampling and alpha blending */
+static void draw_icon_rgba(const unsigned char *data, int iw, int ih,
+                           int x, int y, int size)
 {
-    if (size <= 0 || !ICON_DATA)
+    if (size <= 0 || !data)
         return;
     int x0 = x < cx0 ? cx0 : x;
     int y0 = y < cy0 ? cy0 : y;
     int x1 = x + size - 1 > cx1 ? cx1 : x + size - 1;
     int y1 = y + size - 1 > cy1 ? cy1 : y + size - 1;
     for (int py = y0; py <= y1; py++) {
-        int sy = (int)(((long)(py - y) * ICON_H) / size);
-        if (sy >= ICON_H) sy = ICON_H - 1;
-        const unsigned char *srow = ICON_DATA + (size_t)sy * ICON_W * 4;
+        int sy = (int)(((long)(py - y) * ih) / size);
+        if (sy >= ih) sy = ih - 1;
+        const unsigned char *srow = data + (size_t)sy * iw * 4;
         uint32_t *d = back + (size_t)py * W;
         for (int px = x0; px <= x1; px++) {
-            int sx = (int)(((long)(px - x) * ICON_W) / size);
-            if (sx >= ICON_W) sx = ICON_W - 1;
+            int sx = (int)(((long)(px - x) * iw) / size);
+            if (sx >= iw) sx = iw - 1;
             unsigned a = srow[sx * 4 + 3];
             if (!a)
                 continue;
@@ -978,7 +1060,8 @@ static void draw_dock_icon(void)
 {
     int ix0, iy0, ix1, iy1;
     icon_rect(icon_s, &ix0, &iy0, &ix1, &iy1);
-    draw_icon_rgba(ix0, iy0, ix1 - ix0 + 1);
+    draw_icon_rgba(TERMINAL_ICON_DATA, TERMINAL_ICON_W, TERMINAL_ICON_H,
+                   ix0, iy0, ix1 - ix0 + 1);
     /* running dot under the icon while the app is open (macOS-like) */
     bool running = tm != TM_CLOSED;
     if (running) {
@@ -1542,7 +1625,7 @@ static void render_winbuf(int w, int h)
     {
         double lr = fmax(5.5, 6.5 * u);
         double lcy = (tw_title - 1) / 2.0 + 0.5;
-        double lx[3] = { 20 * u, 20 * u + 22 * u, 20 * u + 44 * u };
+        double lx[3] = { 19 * u, 39 * u, 59 * u };
         uint32_t lcol[3] = { rgb(255, 95, 87), rgb(254, 188, 46), rgb(40, 200, 64) };
         for (int i = 0; i < 3; i++) {
             double ccx = lx[i], ccy = lcy;
@@ -1582,80 +1665,64 @@ static void render_winbuf(int w, int h)
             char ch = tstr[i];
             if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
                 continue;
-            const unsigned char *gl = FONT_BITMAP[ch - FONT_FIRST];
+            const unsigned char (*gl)[FONT_W] =
+                (const unsigned char (*)[FONT_W])FONT_BITMAP[ch - FONT_FIRST];
             for (int ry = 0; ry < FONT_H; ry++) {
                 int py = ty + ry;
                 if (py < 0 || py >= tw_title || py >= h)
                     continue;
-                unsigned char rowb = gl[ry];
-                if (!rowb)
-                    continue;
+                const unsigned char *row = gl[ry];
                 uint32_t *d = winbuf + (size_t)py * w;
                 for (int rx = 0; rx < FONT_W; rx++) {
-                    if (!(rowb & (0x80 >> rx)))
+                    int a = row[rx];
+                    if (!a)
                         continue;
                     int px = tx + i * FONT_W + rx;
                     if (px < 0 || px >= w)
                         continue;
-                    d[px] = rgb(110, 110, 116);
+                    uint32_t ob = d[px];
+                    unsigned rr = ((ob >> 16 & 255) * (255 - a) + 110 * a) / 255;
+                    unsigned gg = ((ob >>  8 & 255) * (255 - a) + 110 * a) / 255;
+                    unsigned bb = ((ob       & 255) * (255 - a) + 116 * a) / 255;
+                    d[px] = rgb(rr, gg, bb);
                 }
             }
         }
     }
 
-    /* terminal grid + caret (only once the shell exists) */
-    if (sh_fd >= 0) {
-        int gx = (int)(8 * u);
-        int gy = tw_title + (int)(4 * u);
-        for (int r = 0; r < t_rows; r++) {
-            int py0 = gy + r * FONT_H;
-            if (py0 >= h)
-                break;
-            for (int c = 0; c < t_cols; c++) {
-                int i = r * t_cols + c;
-                uint8_t ch = tch[i];
-                if (!ch)
-                    continue;
-                if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
-                    ch = '?';
-                const unsigned char *gl = FONT_BITMAP[ch - FONT_FIRST];
-                uint32_t col = cell_color(i);
-                int px0 = gx + c * FONT_W;
-                for (int ry = 0; ry < FONT_H; ry++) {
-                    int py = py0 + ry;
-                    if (py < 0 || py >= h)
-                        continue;
-                    unsigned char rowb = gl[ry];
-                    if (!rowb)
-                        continue;
-                    uint32_t *d = winbuf + (size_t)py * w;
-                    for (int rx = 0; rx < FONT_W; rx++) {
-                        if (!(rowb & (0x80 >> rx)))
-                            continue;
-                        int px = px0 + rx;
-                        if (px < 0 || px >= w)
-                            continue;
-                        d[px] = col;
-                    }
-                }
-            }
+    (void)w; (void)h;
+}
+
+/* rounded-corner 1:1 blit of `tex` over `back`; pixels outside the
+ * rounded rect keep what was in `back` (so the window looks rounded) */
+static void tex_blit_round(const uint32_t *tex, int tx, int ty, int tw, int th,
+                           int alpha)
+{
+    int x0 = tx < cx0 ? cx0 : tx;
+    int y0 = ty < cy0 ? cy0 : ty;
+    int x1 = tx + tw - 1 > cx1 ? cx1 : tx + tw - 1;
+    int y1 = ty + th - 1 > cy1 ? cy1 : ty + th - 1;
+    int r = (int)(WIN_R * u);
+    for (int y = y0; y <= y1; y++) {
+        const uint32_t *s = tex + (size_t)(y - ty) * tw + (x0 - tx);
+        uint32_t *d = back + (size_t)y * W + x0;
+        int in_top = y - ty < r, in_bot = ty + th - 1 - y < r;
+        if (alpha >= 256 && !in_top && !in_bot) {
+            memcpy(d, s, (size_t)(x1 - x0 + 1) * 4);
+            continue;
         }
-        /* caret: solid light block at the cursor cell */
-        if (caret_on) {
-            int px0 = gx + tcx * FONT_W;
-            int py0 = gy + tcy * FONT_H;
-            for (int ry = 0; ry < FONT_H; ry++) {
-                int py = py0 + ry;
-                if (py < 0 || py >= h)
+        for (int x = 0; x <= x1 - x0; x++) {
+            if (in_top || in_bot) {
+                double dd = sd_round(x0 + x + 0.5, y + 0.5, tx, ty,
+                                     tx + tw - 1, ty + th - 1, r);
+                if (dd > 0)
                     continue;
-                uint32_t *d = winbuf + (size_t)py * w;
-                for (int rx = 0; rx < FONT_W; rx++) {
-                    int px = px0 + rx;
-                    if (px < 0 || px >= w)
-                        continue;
-                    d[px] = rgb(235, 235, 238);
-                }
             }
+            uint32_t v = d[x], w = s[x];
+            unsigned rr = ((v >> 16 & 255) * (256 - alpha) + (w >> 16 & 255) * alpha) >> 8;
+            unsigned gg = ((v >>  8 & 255) * (256 - alpha) + (w >>  8 & 255) * alpha) >> 8;
+            unsigned bb = ((v       & 255) * (256 - alpha) + (w       & 255) * alpha) >> 8;
+            d[x] = rgb(rr, gg, bb);
         }
     }
 }
@@ -1663,9 +1730,9 @@ static void render_winbuf(int w, int h)
 /* soft drop shadow around a rect (macOS-like) */
 static void draw_shadow(int x0, int y0, int x1, int y1)
 {
-    double margin = 36 * u;
-    double sigma = 18 * u;
-    double amax = 115;
+    double margin = 22 * u;
+    double sigma = 10 * u;
+    double amax = 58;
     int ex0 = (int)floor(x0 - margin), ex1 = (int)ceil(x1 + margin);
     int ey0 = (int)floor(y0 - margin), ey1 = (int)ceil(y1 + margin);
     if (ex0 < 0) ex0 = 0;
@@ -1680,7 +1747,7 @@ static void draw_shadow(int x0, int y0, int x1, int y1)
                 continue;
             if (x >= x0 && x <= x1 && y >= y0 && y <= y1)
                 continue;
-            double d = sd_round(x + 0.5, y + 0.5, x0, y0, x1, y1, 14 * u);
+            double d = sd_round(x + 0.5, y + 0.5, x0, y0, x1, y1, (WIN_R - 2) * u);
             if (d > margin)
                 continue;
             if (d < 0)
@@ -1699,6 +1766,68 @@ static void draw_shadow(int x0, int y0, int x1, int y1)
     }
 }
 
+/* draw terminal grid + caret straight into `back` (the window texture
+ * holds only chrome and backdrop, so typing never re-renders it) */
+static void draw_term_content(int wx0, int wy0)
+{
+    if (sh_fd < 0)
+        return;
+    int gx = wx0 + (int)(8 * u);
+    int gy = wy0 + tw_title + (int)(4 * u);
+    for (int r = 0; r < t_rows; r++) {
+        int py0 = gy + r * FONT_H;
+        for (int c = 0; c < t_cols; c++) {
+            int i = r * t_cols + c;
+            uint8_t ch = tch[i];
+            if (!ch)
+                continue;
+            if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
+                ch = '?';
+            const unsigned char (*gl)[FONT_W] =
+                (const unsigned char (*)[FONT_W])FONT_BITMAP[ch - FONT_FIRST];
+            uint32_t col = cell_color(i);
+            int px0 = gx + c * FONT_W;
+            for (int ry = 0; ry < FONT_H; ry++) {
+                int py = py0 + ry;
+                if (py < cy0 || py > cy1)
+                    continue;
+                const unsigned char *row = gl[ry];
+                uint32_t *d = back + (size_t)py * W;
+                for (int rx = 0; rx < FONT_W; rx++) {
+                    int a = row[rx];
+                    if (!a)
+                        continue;
+                    int px = px0 + rx;
+                    if (px < cx0 || px > cx1)
+                        continue;
+                    uint32_t ob = d[px];
+                    unsigned rr = ((ob >> 16 & 255) * (255 - a) + (col >> 16 & 255) * a) / 255;
+                    unsigned gg = ((ob >>  8 & 255) * (255 - a) + (col >>  8 & 255) * a) / 255;
+                    unsigned bb = ((ob       & 255) * (255 - a) + (col       & 255) * a) / 255;
+                    d[px] = rgb(rr, gg, bb);
+                }
+            }
+        }
+    }
+    /* caret: solid light block at the cursor cell */
+    if (caret_on) {
+        int px0 = gx + tcx * FONT_W;
+        int py0 = gy + tcy * FONT_H;
+        for (int ry = 0; ry < FONT_H; ry++) {
+            int py = py0 + ry;
+            if (py < cy0 || py > cy1)
+                continue;
+            uint32_t *d = back + (size_t)py * W;
+            for (int rx = 0; rx < FONT_W; rx++) {
+                int px = px0 + rx;
+                if (px < cx0 || px > cx1)
+                    continue;
+                d[px] = rgb(235, 235, 238);
+            }
+        }
+    }
+}
+
 /* ---------------- terminal window: states & animations ------------------ */
 /* stable states: CLOSED / OPEN / MINIMIZED; transitions carry an animation */
 static bool tm_anim = false;
@@ -1713,6 +1842,7 @@ static bool tm_zoomed = false;
 static int force_x0, force_y0, force_x1, force_y1;   /* post-anim repaint  */
 static bool force_dirty = false;
 static bool force_full = false;         /* wipe the whole screen once   */
+static bool g_full = false;             /* full repaint in this frame   */
 
 static void win_norm_rect(int *x0, int *y0, int *x1, int *y1)
 {
@@ -1886,17 +2016,20 @@ static void draw_window(void)
     int x0, y0, x1, y1, alpha;
     if (!win_cur_rect(&x0, &y0, &x1, &y1, &alpha))
         return;
-    if (alpha >= 250)
-        draw_shadow(x0, y0, x1, y1);
+    if ((tm_anim || g_full) && alpha >= 250)
+        draw_shadow(x0, y0, x1, y1);          /* otherwise it is already on screen */
     int bw = A_bufw, bh = A_bufh;             /* dims the texture was built for */
     if (!tm_anim) {
         bw = x1 - x0 + 1;
         bh = y1 - y0 + 1;
     }
-    if (bw == x1 - x0 + 1 && bh == y1 - y0 + 1)
-        tex_blit(winbuf, x0, y0, bw, bh, alpha);
-    else
+    if (bw == x1 - x0 + 1 && bh == y1 - y0 + 1) {
+        tex_blit_round(winbuf, x0, y0, bw, bh, alpha);
+        if (!tm_anim)
+            draw_term_content(x0, y0);        /* text lives only on screen */
+    } else {
         tex_blit_scaled(winbuf, bw, bh, x0, y0, x1, y1, alpha);
+    }
 }
 
 /* ---------------- mouse --------------------------------------------------- */
@@ -1984,7 +2117,7 @@ static bool click_in_buttons(int x, int y, int wx0, int wy0)
 {
     double lr = fmax(5.5, 6.5 * u) + 4;       /* slop for easier clicks */
     double lcy = wy0 + (tw_title - 1) / 2.0 + 0.5;
-    double lx[3] = { 20 * u, 20 * u + 22 * u, 20 * u + 44 * u };
+    double lx[3] = { 19 * u, 39 * u, 59 * u };
     for (int i = 0; i < 3; i++)
         if (hypot(x - (wx0 + lx[i]), y - lcy) <= lr)
             return true;
@@ -2026,7 +2159,7 @@ static void handle_click(int x, int y)
             if (click_in_buttons(x, y, a, b)) {
                 double lr = fmax(5.5, 6.5 * u) + 4;
                 double lcy = b + (tw_title - 1) / 2.0 + 0.5;
-                double lx[3] = { 20 * u, 20 * u + 22 * u, 20 * u + 44 * u };
+                double lx[3] = { 19 * u, 39 * u, 59 * u };
                 double dist0 = hypot(x - (a + lx[0]), y - lcy);
                 double dist1 = hypot(x - (a + lx[1]), y - lcy);
                 double dist2 = hypot(x - (a + lx[2]), y - lcy);
@@ -2101,7 +2234,7 @@ static void boot_log_rect(int *x0, int *y0, int *x1, int *y1)
     *x0 = LOG_MARGIN - 2;
     *x1 = W - LOG_MARGIN + 2;
     *y1 = H - 1;
-    *y0 = H - LOG_MARGIN - DISPLAY_LINES * font_h_s(fs) - 2;
+    *y0 = H - LOG_MARGIN - DISPLAY_LINES * font_h_s(1) - 2;
     if (*y0 < 0) *y0 = 0;
 }
 
@@ -2126,10 +2259,10 @@ static void draw_log_lines(void)
     if (nl <= 0)
         return;
     int first = reveal_n - nl;
-    int ty = H - LOG_MARGIN - nl * font_h_s(fs);
+    int ty = H - LOG_MARGIN - nl * font_h_s(1);
     for (int i = 0; i < nl; i++)
-        draw_text_s(LOG_MARGIN, ty + i * font_h_s(fs), hist[first + i].text,
-                    rgb(LOG_R, LOG_G, LOG_B), fs);
+        draw_text_s(LOG_MARGIN, ty + i * font_h_s(1), hist[first + i].text,
+                    rgb(LOG_R, LOG_G, LOG_B), 1);
 }
 
 /* ---------------- main ------------------------------------------------------ */
@@ -2287,14 +2420,6 @@ int main(void)
             anim_update();
             term_poll();
 
-            /* re-render the window texture when the terminal produced output
-             * or the caret blinked (only in a stable, visible state) */
-            if (term_dirty && !tm_anim && tm == TM_OPEN) {
-                int a, b, c, d, al;
-                if (win_cur_rect(&a, &b, &c, &d, &al))
-                    render_winbuf(c - a + 1, d - b + 1);
-            }
-
             /* ---------- dirty rect collection ---------- */
             drn = 0;
             if (scene_invalid || force_full) {
@@ -2358,12 +2483,12 @@ int main(void)
                             static int px0 = -1, py0 = -1, px1 = -1, py1 = -1;
                             if (term_dirty ||
                                 a != px0 || b != py0 || c != px1 || d != py1) {
-                                add_rect(a - m, b - m, c + m, d + m);
+                                add_rect(a - 2, b - 2, c + 2, d + 2);
                                 px0 = a; py0 = b; px1 = c; py1 = d;
                             }
                             if (mx >= a - 4 && mx <= c + 4 && my >= b - 4 && my <= d + 4 &&
                                 (mx != pmx || my != pmy))
-                                add_rect(a - m, b - m, c + m, d + m);
+                                add_rect(a - 2, b - 2, c + 2, d + 2);
                         }
                         term_dirty = false;
                     }
@@ -2371,8 +2496,11 @@ int main(void)
             }
             scene_invalid = false;
 
+            g_full = drn == 1 && dr[0].x0 == 0 && dr[0].y0 == 0 &&
+                     dr[0].x1 == W - 1 && dr[0].y1 == H - 1;
             for (int i = 0; i < drn; i++)
                 scene_render(dr[i].x0, dr[i].y0, dr[i].x1, dr[i].y1);
+            g_full = false;
         }
 
         if (!ready) {

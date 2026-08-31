@@ -19,9 +19,10 @@ echo "[*] Kernel: $KVER"
 echo "[*] Wallpaper: $WALL_SRC"
 
 echo "[1/6] Font + wallpaper + icon"
-python3 "$SRC/mkfont.py" "$BUILD/font.h"
+python3 "$SRC/mkfont.py" "$BUILD/font.h" 13
 python3 "$SRC/mkwallpaper.py" "$WALL_SRC" "$BUILD/wallpaper.raw"
-python3 "$SRC/mkicon.py" "$ROOT/assets/terminal-icon.png" "$BUILD/terminal_icon.h"
+python3 "$SRC/mkicon.py" "$ROOT/assets/terminal-icon.png" "$BUILD/terminal_icon.h" TERMINAL_ICON
+python3 "$SRC/mkicon.py" "$ROOT/assets/drop-icon.png" "$BUILD/drop_icon.h" DROP_ICON
 
 echo "[2/6] splash (static)"
 gcc -O2 -std=gnu11 -static -I"$BUILD" -o "$BUILD/splash" "$SRC/splash.c" -lm
