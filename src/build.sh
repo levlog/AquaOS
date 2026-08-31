@@ -18,8 +18,9 @@ VMLINUZ="$P/boot/vmlinuz-$KVER"
 echo "[*] Kernel: $KVER"
 echo "[*] Wallpaper: $WALL_SRC"
 
-echo "[1/6] Font + wallpaper + icon"
+echo "[1/6] Fonts + wallpaper + icons"
 python3 "$SRC/mkfont.py" "$BUILD/font.h" 13
+python3 "$SRC/mkfont.py" --ui "$BUILD/font_ui.h" 13
 python3 "$SRC/mkwallpaper.py" "$WALL_SRC" "$BUILD/wallpaper.raw"
 python3 "$SRC/mkicon.py" "$ROOT/assets/terminal-icon.png" "$BUILD/terminal_icon.h" TERMINAL_ICON
 python3 "$SRC/mkicon.py" "$ROOT/assets/drop-icon.png" "$BUILD/drop_icon.h" DROP_ICON

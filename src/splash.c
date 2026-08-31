@@ -41,6 +41,7 @@
 #include <linux/kd.h>
 
 #include "font.h"
+#include "font_ui.h"
 #include "terminal_icon.h"
 #include "drop_icon.h"
 
@@ -61,8 +62,7 @@
 #define SAFETY_SECONDS   45.0    /* fade even if init never signals     */
 #define FRAME_DT         (1.0 / 60.0)
 #define FPS_WINDOW       0.5     /* FPS averaging window, seconds       */
-#define MENU_TITLE       "Settings >"
-#define MENU_X           12      /* menu title x offset, px             */
+#define MENU_X           10      /* panel logo x offset, px             */
 #define DOCK_MARGIN_B    7       /* dock gap from the bottom edge, px   */
 #define CURSOR_W         13      /* arrow cursor sprite, px (scaled)    */
 #define CURSOR_H         19
@@ -116,9 +116,29 @@ static bool menu_open = false;
 static double menu_a = 0; /* dropdown animation 0..1                   */
 static bool menu_closing = false;
 static bool in_desktop = false;
-static int ti_x0, ti_y0, ti_x1, ti_y1;   /* "Settings >" title rect    */
+static int ti_x0, ti_y0, ti_x1, ti_y1;   /* "Settings" item rect       */
+static int dr_x0, dr_y0, dr_x1, dr_y1;   /* droplet logo rect          */
+static int set_x;                        /* "Settings" text x          */
 static int dd_x0, dd_y0, dd_x1, dd_y1;   /* dropdown rect              */
-static int it_x0, it_y0, it_x1, it_y1;   /* About item rect            */
+static int it_x0, it_y0, it_x1, it_y1;   /* "About AquaOS" item rect   */
+
+/* macOS menu bar clock (real system time, HH:MM) */
+static char clk_str[8];
+static bool clk_valid = false;
+
+/* About panel (real data only: kernel, framebuffer, uptime, fps) */
+static bool about_open = false;
+static bool about_dirty = false;
+static int ab_x0, ab_y0, ab_x1, ab_y1;
+static char kver[48];          /* kernel release, parsed from real kmsg */
+
+/* pre-baked frosted panels (dropdown / About) incl. soft shadow  */
+static uint32_t *menu_tex;
+static int menu_tex_w, menu_tex_h;
+static int DDMc;                          /* dropdown shadow margin     */
+static uint32_t *about_tex;
+static int about_tex_w, about_tex_h;
+static int AMDc;                          /* About shadow margin        */
 
 /* dock state */
 static int ddx0, ddy0, ddx1, ddy1;       /* dock glass rect            */
@@ -221,28 +241,7 @@ static void blit_rect(int x0, int y0, int x1, int y1)
 }
 
 /* blend `alpha` (0..256) of `tex` over `back` at 1:1, clipped */
-static void tex_blit(const uint32_t *tex, int tx, int ty, int tw, int th, int alpha)
-{
-    int x0 = tx < cx0 ? cx0 : tx;
-    int y0 = ty < cy0 ? cy0 : ty;
-    int x1 = tx + tw - 1 > cx1 ? cx1 : tx + tw - 1;
-    int y1 = ty + th - 1 > cy1 ? cy1 : ty + th - 1;
-    for (int y = y0; y <= y1; y++) {
-        const uint32_t *s = tex + (size_t)(y - ty) * tw + (x0 - tx);
-        uint32_t *d = back + (size_t)y * W + x0;
-        if (alpha >= 256) {
-            memcpy(d, s, (size_t)(x1 - x0 + 1) * 4);
-        } else {
-            for (int x = 0; x <= x1 - x0; x++) {
-                uint32_t v = d[x], w = s[x];
-                unsigned r = ((v >> 16 & 255) * (256 - alpha) + (w >> 16 & 255) * alpha) >> 8;
-                unsigned g = ((v >>  8 & 255) * (256 - alpha) + (w >>  8 & 255) * alpha) >> 8;
-                unsigned b = ((v       & 255) * (256 - alpha) + (w       & 255) * alpha) >> 8;
-                d[x] = rgb(r, g, b);
-            }
-        }
-    }
-}
+/* (opaque blit removed in v6; alpha-aware tex_blit_alpha lives below) */
 
 /* nearest-neighbour scaled blend of `tex` into an arbitrary dst rect */
 static void tex_blit_scaled(const uint32_t *tex, int tw, int th,
@@ -381,7 +380,8 @@ static double seg_dist(double px, double py,
 static int ww, wh, wx, wy;        /* terminal window target rect (normal) */
 static int tw_title;              /* title bar height                     */
 static uint32_t *winbuf;          /* window texture (max size)            */
-static int winbuf_w, winbuf_h;    /* current texture dims                 */
+static int winbuf_w, winbuf_h;    /* current texture dims (incl. margin)  */
+static int SMc;                   /* baked shadow margin around window    */
 static uint32_t *winblur;         /* blurred backdrop under the window    */
 static int winblur_w, winblur_h, winblur_x0, winblur_y0;
 static int mw_x0, mw_y0, mw_x1, mw_y1;   /* maximized ("zoomed") rect     */
@@ -399,9 +399,12 @@ static bool caret_on = true;      /* caret blink phase                    */
 /* ---------------- desktop panel --------------------------------------- */
 static void build_desktop(void)
 {
-    panel_h = (int)fmax(30.0, H * 0.037);
+    panel_h = (int)fmax(26.0, 28.0 * u);      /* slim macOS menu bar */
     if (panel_h > H / 4)
         panel_h = H / 4;
+    SMc = (int)(22 * u);                      /* window shadow margin */
+    DDMc = (int)(16 * u);                     /* dropdown shadow margin */
+    AMDc = (int)(16 * u);                     /* About panel shadow margin */
     desktop = malloc((size_t)W * H * 4);
     if (!desktop)
         return;
@@ -552,6 +555,8 @@ static void build_desktop(void)
     free(s4);
 
     winbuf = malloc((size_t)W * (size_t)(H - panel_h) * 4);
+    menu_tex = malloc((size_t)((int)(262 * u)) * (size_t)((int)(76 * u)) * 4);
+    about_tex = malloc((size_t)((int)(372 * u)) * (size_t)((int)(226 * u)) * 4);
     fprintf(stderr, "splash: desktop ready (panel %d, dock %dx%d, win %dx%d@%d,%d)\n",
             panel_h, ddx1 - ddx0 + 1, dock_h, ww, wh, wx, wy);
 }
@@ -605,6 +610,16 @@ static void handle_record(char *rec, ssize_t n)
     char *msg = semi + 1;
     if (!*msg)
         return;
+    /* grab the real kernel release from its genuine boot banner */
+    if (!kver[0] && strncmp(msg, "Linux version ", 14) == 0) {
+        const char *v = msg + 14;
+        size_t k = 0;
+        while (v[k] && v[k] != ' ' && k < sizeof(kver) - 1) {
+            kver[k] = v[k];
+            k++;
+        }
+        kver[k] = 0;
+    }
     if (cont && hist_n > 0) {                 /* continuation of previous line */
         KLine *k = &hist[hist_n - 1];
         size_t len = strlen(k->text);
@@ -680,6 +695,99 @@ static void draw_text_s(int x, int y, const char *str, uint32_t col, int s)
     int maxc = (W - 2 * LOG_MARGIN) / font_w_s(s);
     for (int i = 0; str[i] && i < maxc; i++)
         draw_char_s(x + i * font_w_s(s), y, str[i], col, s);
+}
+
+/* ---- proportional UI font (Carlito, anti-aliased, variable width) ---- */
+static int ui_adv(char ch, int bold)
+{
+    int i = (int)(unsigned char)ch - UIF_FIRST;
+    if (i < 0 || i >= UIF_COUNT)
+        return 6;
+    return bold ? UIFB_ADV[i] : UIF_ADV[i];
+}
+
+static int ui_text_w(const char *s, int bold)
+{
+    int w = 0;
+    for (; *s; s++)
+        w += ui_adv(*s, bold);
+    return w;
+}
+
+/* generic glyph blit into an arbitrary ARGB buffer with explicit clip */
+static void ui_char_buf(uint32_t *buf, int stride, int qx0, int qy0,
+                        int qx1, int qy1, int x, int y, char ch,
+                        uint32_t col, int bold)
+{
+    if (ch < UIF_FIRST || ch > UIF_FIRST + UIF_COUNT - 1)
+        return;
+    int i = ch - UIF_FIRST;
+    int gw = bold ? UIFB_GW[i] : UIF_GW[i];
+    int gh = bold ? UIFB_GH[i] : UIF_GH[i];
+    int ox = bold ? UIFB_OX[i] : UIF_OX[i];
+    int oy = bold ? UIFB_OY[i] : UIF_OY[i];
+    const unsigned char *bm = (bold ? UIFB_BM[i][0] : UIF_BM[i][0]);
+    int cr = col >> 16 & 255, cg = col >> 8 & 255, cb = col & 255;
+    for (int ry = 0; ry < gh; ry++) {
+        int py = y + oy + ry;
+        if (py < qy0 || py > qy1)
+            continue;
+        const unsigned char *row = bm + (size_t)ry * UIF_MAXW;
+        uint32_t *d = buf + (size_t)py * stride;
+        for (int rx = 0; rx < gw; rx++) {
+            int a = row[rx];
+            if (!a)
+                continue;
+            int px = x + ox + rx;
+            if (px < qx0 || px > qx1)
+                continue;
+            uint32_t ob = d[px];
+            unsigned rr = ((ob >> 16 & 255) * (255 - a) + cr * a) / 255;
+            unsigned gg = ((ob >>  8 & 255) * (255 - a) + cg * a) / 255;
+            unsigned bb = ((ob       & 255) * (255 - a) + cb * a) / 255;
+            d[px] = rgb(rr, gg, bb);
+        }
+    }
+}
+
+/* draw into `back`, honoring the global clip rect */
+static void ui_char(int x, int y, char ch, uint32_t col, int bold)
+{
+    ui_char_buf(back, W, cx0, cy0, cx1, cy1, x, y, ch, col, bold);
+}
+
+static void ui_text(int x, int y, const char *s, uint32_t col, int bold)
+{
+    for (; *s; s++) {
+        ui_char(x, y, *s, col, bold);
+        x += ui_adv(*s, bold);
+    }
+}
+
+/* draw into an off-screen texture with explicit bounds */
+static void ui_text_tex(uint32_t *tex, int tstride, int th_, int x, int y,
+                        const char *s, uint32_t col, int bold)
+{
+    for (; *s; s++) {
+        ui_char_buf(tex, tstride, 0, 0, tstride - 1, th_ - 1,
+                    x, y, *s, col, bold);
+        x += ui_adv(*s, bold);
+    }
+}
+
+/* ---- real clock for the menu bar (right side, macOS-like) ---- */
+static void clock_update(void)
+{
+    time_t rt = time(NULL);
+    struct tm tmb;
+    if (!localtime_r(&rt, &tmb))
+        return;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", tmb.tm_hour, tmb.tm_min);
+    if (!clk_valid || strcmp(buf, clk_str) != 0) {
+        snprintf(clk_str, sizeof(clk_str), "%s", buf);
+        clk_valid = true;
+    }
 }
 
 /* anti-aliased rounded rect: fill (border=0) or 1px edge band */
@@ -890,10 +998,10 @@ static void draw_cursor(void)
 /* live FPS readout, top-right corner (inside the panel on the desktop) */
 static void fps_bbox(int *bx0, int *by0, int *bx1, int *by1)
 {
-    int tw = 7 * font_w_s(1);                 /* "999 FPS" worst case */
-    *bx1 = W - LOG_MARGIN + 4;
+    int tw = ui_text_w("999 FPS", 0) + 14 + ui_text_w("23:59", 0);
+    *bx1 = W - 12 + 4;
     *bx0 = *bx1 - tw - 8;
-    *by0 = (panel_h - font_h_s(1)) / 2 - 2;
+    *by0 = (panel_h - UIF_CELLH) / 2 - 2;
     if (*by0 < 0) *by0 = 0;
     *by1 = panel_h - 1;
 }
@@ -904,38 +1012,59 @@ static void draw_fps(int dark)
     if (!fps_ready)
         return;                               /* no completed window yet */
     snprintf(buf, sizeof(buf), "%d FPS", fps_now);
-    int len = 0;
-    while (buf[len])
-        len++;
-    int x = W - LOG_MARGIN - len * font_w_s(1);
-    int y = (panel_h - font_h_s(1)) / 2;
+    int x = W - 12 - ui_text_w("23:59", 0) - 14 - ui_text_w(buf, 0);
+    int y = (panel_h - UIF_CELLH) / 2;
     if (y < 2)
         y = 2;
-    draw_text_s(x, y, buf, dark ? rgb(60, 60, 67) : rgb(168, 170, 176), 1);
+    ui_text(x, y, buf, dark ? rgb(60, 60, 67) : rgb(168, 170, 176), 0);
+}
+
+static void draw_clock(int dark)
+{
+    if (!clk_valid)
+        return;
+    int x = W - 12 - ui_text_w(clk_str, 0);
+    int y = (panel_h - UIF_CELLH) / 2;
+    if (y < 2)
+        y = 2;
+    ui_text(x, y, clk_str, dark ? rgb(60, 60, 67) : rgb(168, 170, 176), 0);
 }
 
 /* ---------------- menu bar --------------------------------------------- */
 static void menu_geometry(void)
 {
-    int tx = MENU_X + 28;                     /* drop icon (24) + gap    */
-    int tw = (int)strlen("Settings") * FONT_W;
-    ti_x0 = tx - 8;
-    ti_y0 = 0;
-    ti_x1 = tx + tw + (int)(17 * u) + 5;      /* text + chevron          */
-    ti_y1 = panel_h - 1;
-    dd_x0 = MENU_X - 8;
-    dd_y0 = panel_h + 2;
-    dd_x1 = dd_x0 + (int)(190 * u);
-    dd_y1 = dd_y0 + (int)(48 * u);
-    it_x0 = dd_x0 + (int)(4 * u);
-    it_y0 = dd_y0 + (int)(4 * u);
-    it_x1 = dd_x1 - (int)(4 * u);
-    it_y1 = it_y0 + (int)(40 * u);
+    int drop_s = (int)fmax(13.0, 15.0 * u);
+    dr_x0 = MENU_X;
+    dr_y0 = (panel_h - drop_s) / 2;
+    dr_x1 = dr_x0 + drop_s - 1;
+    dr_y1 = dr_y0 + drop_s - 1;
+    set_x = dr_x1 + 1 + (int)(11 * u);
+    int tww = ui_text_w("Settings", 1);
+    ti_x0 = set_x - (int)(8 * u);
+    ti_y0 = (int)(3 * u);
+    ti_x1 = set_x + tww + 4 + 9 + (int)(7 * u);   /* text + gap + chevron */
+    ti_y1 = panel_h - 1 - (int)(3 * u);
+    /* the dropdown hangs below the item it belongs to (macOS) */
+    dd_x0 = ti_x0;
+    dd_y0 = panel_h + (int)(3 * u);
+    int mw = ui_text_w("About AquaOS", 0) + (int)(40 * u);
+    if (mw < (int)(150 * u))
+        mw = (int)(150 * u);
+    dd_x1 = dd_x0 + mw;
+    it_x0 = dd_x0 + (int)(5 * u);
+    it_y0 = dd_y0 + (int)(5 * u);
+    it_x1 = dd_x1 - (int)(5 * u);
+    it_y1 = it_y0 + (int)(26 * u);
+    dd_y1 = it_y1 + (int)(5 * u);
 }
 
 /* draw an arbitrary RGBA icon (premultiplied-less, straight alpha) */
 static void draw_icon_rgba(const unsigned char *data, int iw, int ih,
                            int x, int y, int size);
+
+/* alpha-aware texture blitters (defined further below) */
+static void tex_blit_alpha(const uint32_t *tex, int tx, int ty, int tw_,
+                           int th_, int galpha);
 
 /* small anti-aliased chevron pointing down (~9x6 px) */
 static void draw_chevron(int x, int y, uint32_t col)
@@ -972,73 +1101,245 @@ static void draw_chevron(int x, int y, uint32_t col)
     }
 }
 
+/* ---- frosted macOS panels (dropdown / About), baked with soft shadow ----
+ * texel format: ARGB, alpha in the top byte; shadow texels are pure alpha */
+static void bake_panel_tex(uint32_t *tex, int *ptw, int *pth,
+                           int px0, int py0, int px1, int py1,
+                           int M, double rad, double sigma, double amax)
+{
+    int pw = px1 - px0 + 1, ph = py1 - py0 + 1;
+    int tw_ = pw + 2 * M, th_ = ph + 2 * M;
+    *ptw = tw_;
+    *pth = th_;
+    memset(tex, 0, (size_t)tw_ * th_ * 4);
+
+    /* blurred backdrop for the frosted look */
+    int bx0 = px0 - M < 0 ? 0 : px0 - M;
+    int by0 = py0 - M < 0 ? 0 : py0 - M;
+    int bx1 = px1 + M > W - 1 ? W - 1 : px1 + M;
+    int by1 = py1 + M > H - 1 ? H - 1 : py1 + M;
+    int bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+    uint32_t *s1 = NULL, *s2 = NULL;
+    bool have_blur = false;
+    if (bw > 0 && bh > 0) {
+        s1 = malloc((size_t)bw * bh * 4);
+        s2 = malloc((size_t)bw * bh * 4);
+        if (s1 && s2) {
+            for (int y = 0; y < bh; y++)
+                memcpy(s1 + (size_t)y * bw,
+                       desktop + (size_t)(by0 + y) * W + bx0, (size_t)bw * 4);
+            box_blur_h(s2, s1, bw, bh, 4);
+            box_blur_v(s1, s2, bw, bh, 2);
+            have_blur = true;
+        }
+    }
+
+    for (int y = 0; y < th_; y++) {
+        uint32_t *d = tex + (size_t)y * tw_;
+        for (int x = 0; x < tw_; x++) {
+            double dS = sd_round(x + 0.5, y + 0.5, M, M, M + pw - 1,
+                                 M + ph - 1, rad);
+            if (dS <= 0.5) {                  /* panel body (AA edge) */
+                double cov = 0.5 - dS;
+                if (cov > 1)
+                    cov = 1;
+                unsigned r = 246, g = 246, b = 248;
+                if (have_blur) {
+                    int sx = px0 - M + x - bx0;
+                    int sy = py0 - M + y - by0;
+                    if (sx < 0) sx = 0;
+                    if (sy < 0) sy = 0;
+                    if (sx >= bw) sx = bw - 1;
+                    if (sy >= bh) sy = bh - 1;
+                    uint32_t v = s1[(size_t)sy * bw + sx];
+                    r = (unsigned)(((v >> 16 & 255) * 56 + 246 * 200) >> 8);
+                    g = (unsigned)(((v >>  8 & 255) * 56 + 246 * 200) >> 8);
+                    b = (unsigned)(((v       & 255) * 59 + 248 * 197) >> 8);
+                }
+                double bcov = 0.5 - fabs(dS); /* hairline border */
+                if (bcov > 0) {
+                    if (bcov > 1)
+                        bcov = 1;
+                    int BA = (int)(bcov * 44 + 0.5);
+                    r = (unsigned)((r * (255 - BA)) / 255);
+                    g = (unsigned)((g * (255 - BA)) / 255);
+                    b = (unsigned)((b * (255 - BA)) / 255);
+                }
+                int A = (int)(cov * 255.0 + 0.5);
+                d[x] = ((uint32_t)A << 24) | (r << 16) | (g << 8) | b;
+            } else if (dS <= M) {             /* soft neutral shadow */
+                double a = amax * exp(-(dS - 0.5) / sigma);
+                int A = (int)(a + 0.5);
+                if (A > 255)
+                    A = 255;
+                if (A >= 2)
+                    d[x] = (uint32_t)A << 24;
+            }
+        }
+    }
+    free(s1);
+    free(s2);
+}
+
+static void render_menu_tex(void)
+{
+    if (!menu_tex || !desktop)
+        return;
+    bake_panel_tex(menu_tex, &menu_tex_w, &menu_tex_h,
+                   dd_x0, dd_y0, dd_x1, dd_y1, DDMc, 8.0 * u, 8.0 * u, 70.0);
+}
+
+static void render_about_tex(void)
+{
+    if (!about_tex || !desktop)
+        return;
+    char ln_kernel[80], ln_fb[80], ln_up[80], ln_fps[80];
+    int n = 0;
+    const char *lines[6];
+    lines[n++] = "Version 1.6 (AquaOS desktop)";
+    if (kver[0]) {
+        snprintf(ln_kernel, sizeof(ln_kernel), "Kernel %s", kver);
+        lines[n++] = ln_kernel;
+    }
+    snprintf(ln_fb, sizeof(ln_fb), "Framebuffer %dx%d @ %d bpp", W, H, BPP * 8);
+    lines[n++] = ln_fb;
+    double up = now();
+    snprintf(ln_up, sizeof(ln_up), "Uptime %d:%02d:%02d",
+             (int)up / 3600, ((int)up / 60) % 60, (int)up % 60);
+    lines[n++] = ln_up;
+    if (fps_ready) {
+        snprintf(ln_fps, sizeof(ln_fps), "Compositor %d FPS", fps_now);
+        lines[n++] = ln_fps;
+    }
+    int wmax = ui_text_w("AquaOS", 1);
+    for (int i = 0; i < n; i++) {
+        int w = ui_text_w(lines[i], 0);
+        if (w > wmax)
+            wmax = w;
+    }
+    int pw = wmax + (int)(44 * u);
+    int ph = (int)(16 * u) + UIF_CELLH + (int)(7 * u) +
+             n * (UIF_CELLH + (int)(5 * u)) + (int)(15 * u);
+    if (pw > (int)(330 * u))
+        pw = (int)(330 * u);
+    if (ph > (int)(188 * u))
+        ph = (int)(188 * u);
+    ab_x0 = (W - pw) / 2;
+    ab_x1 = ab_x0 + pw - 1;
+    ab_y0 = (H - ph) * 2 / 5;
+    ab_y1 = ab_y0 + ph - 1;
+    bake_panel_tex(about_tex, &about_tex_w, &about_tex_h,
+                   ab_x0, ab_y0, ab_x1, ab_y1, AMDc, 10.0 * u, 8.0 * u, 80.0);
+    int tx = AMDc + (int)(22 * u);
+    int ty = AMDc + (int)(16 * u);
+    ui_text_tex(about_tex, about_tex_w, about_tex_h, tx, ty, "AquaOS",
+                rgb(20, 20, 24), 1);
+    ty += UIF_CELLH + (int)(7 * u);
+    for (int i = 0; i < n; i++) {
+        ui_text_tex(about_tex, about_tex_w, about_tex_h, tx, ty, lines[i],
+                    rgb(60, 60, 66), 0);
+        ty += UIF_CELLH + (int)(5 * u);
+    }
+}
+
+static void draw_about(void)
+{
+    if (!about_open || !about_tex)
+        return;
+    tex_blit_alpha(about_tex, ab_x0 - AMDc, ab_y0 - AMDc,
+                   about_tex_w, about_tex_h, 256);
+}
+
 static void draw_menu_animated(void)
 {
-    bool hov = in_rect(mx, my, ti_x0, ti_y0, ti_x1, ti_y1);
-    /* drop icon at the logo position (never highlighted) */
+    /* droplet logo at the left (clickable, never highlighted) */
     draw_icon_rgba(DROP_ICON_DATA, DROP_ICON_W, DROP_ICON_H,
-                   MENU_X - 2, (panel_h - (int)(22 * u)) / 2, (int)(22 * u));
-    if (menu_open || hov)
+                   dr_x0, dr_y0, dr_x1 - dr_x0 + 1);
+    bool hov = in_rect(mx, my, ti_x0, ti_y0, ti_x1, ti_y1);
+    if (menu_open)
         paint_round(ti_x0, ti_y0, ti_x1, ti_y1, 5, rgb(10, 122, 255), 256, 0);
-    draw_text_s(MENU_X + 28, (panel_h - font_h_s(1)) / 2, "Settings",
-                (menu_open || hov) ? rgb(255, 255, 255) : rgb(28, 28, 30), 1);
-    draw_chevron(MENU_X + 28 + (int)strlen("Settings") * FONT_W + 5,
-                 (panel_h - 7) / 2,
-                 (menu_open || hov) ? rgb(255, 255, 255) : rgb(70, 70, 75));
+    else if (hov)
+        paint_round(ti_x0, ti_y0, ti_x1, ti_y1, 5, rgb(0, 0, 0), 30, 0);
+    int ty = (panel_h - UIF_CELLH) / 2;
+    if (ty < 2)
+        ty = 2;
+    ui_text(set_x, ty, "Settings",
+            menu_open ? rgb(255, 255, 255) : rgb(28, 28, 30), 1);
+    draw_chevron(set_x + ui_text_w("Settings", 1) + 4, (panel_h - 7) / 2,
+                 menu_open ? rgb(255, 255, 255) : rgb(70, 70, 75));
     if (menu_a <= 0.003)
         return;
 
-    /* eased open state: slide + fade */
+    /* eased open state: slide + fade, texture includes the soft shadow */
     double e = menu_a;
     e = e * e * (3 - 2 * e);                  /* smoothstep */
-    int slide = (int)((1.0 - e) * -14 * u);
-    int alpha = (int)(e * 250);
-
-    int oy = slide;
-    paint_round(dd_x0 + 2, dd_y0 + 3 + oy, dd_x1 + 2, dd_y1 + 3 + oy,
-                9, rgb(0, 0, 0), alpha * 60 / 250, 0);
-    paint_round(dd_x0, dd_y0 + oy, dd_x1, dd_y1 + oy,
-                8, rgb(246, 246, 248), alpha, 0);
-    paint_round(dd_x0, dd_y0 + oy, dd_x1, dd_y1 + oy,
-                8, rgb(0, 0, 0), alpha * 34 / 250, 1);
+    int oy = (int)((1.0 - e) * -10 * u);
+    int alpha = (int)(e * 256);
+    if (alpha > 256)
+        alpha = 256;
+    tex_blit_alpha(menu_tex, dd_x0 - DDMc, dd_y0 - DDMc + oy,
+                   menu_tex_w, menu_tex_h, alpha);
     int iy0 = it_y0 + oy, iy1 = it_y1 + oy;
     bool ah = in_rect(mx, my, it_x0, iy0, it_x1, iy1);
-    if (ah)
+    if (ah && alpha > 60)
         paint_round(it_x0, iy0, it_x1, iy1, 5, rgb(10, 122, 255), alpha, 0);
-    draw_text_s(it_x0 + (int)(10 * u),
-                iy0 + (it_y1 - it_y0 - font_h_s(1)) / 2, "About",
-                ah ? rgb(255, 255, 255) : rgb(28, 28, 30), 1);
+    /* text only while visibly open: ui_text has no per-call alpha, so
+     * drawing it during the fade-out tail would leave a ghost behind */
+    if (alpha > 150) {
+        int lty = iy0 + ((iy1 - iy0) - UIF_CELLH) / 2;
+        ui_text(it_x0 + (int)(10 * u), lty, "About AquaOS",
+                ah ? rgb(255, 255, 255) : rgb(28, 28, 30), 0);
+    }
 }
 
 /* ---------------- dock icons -------------------------------------------- */
-/* draw an RGBA icon with nearest sampling and alpha blending */
+/* draw an RGBA icon with bilinear sampling and alpha blending (smooth at
+ * any scale, no ragged nearest-neighbour edges) */
 static void draw_icon_rgba(const unsigned char *data, int iw, int ih,
                            int x, int y, int size)
 {
-    if (size <= 0 || !data)
+    if (size <= 0 || !data || iw < 1 || ih < 1)
         return;
     int x0 = x < cx0 ? cx0 : x;
     int y0 = y < cy0 ? cy0 : y;
     int x1 = x + size - 1 > cx1 ? cx1 : x + size - 1;
     int y1 = y + size - 1 > cy1 ? cy1 : y + size - 1;
     for (int py = y0; py <= y1; py++) {
-        int sy = (int)(((long)(py - y) * ih) / size);
-        if (sy >= ih) sy = ih - 1;
-        const unsigned char *srow = data + (size_t)sy * iw * 4;
+        double fy = ((double)(py - y) + 0.5) * ih / size - 0.5;
+        if (fy < 0) fy = 0;
+        if (fy > ih - 1) fy = ih - 1;
+        int iy = (int)fy;
+        int iy1_ = iy + 1 < ih ? iy + 1 : iy;
+        double ty_ = iy1_ == iy ? 0 : fy - iy;
+        const unsigned char *r0 = data + (size_t)iy * iw * 4;
+        const unsigned char *r1 = data + (size_t)iy1_ * iw * 4;
         uint32_t *d = back + (size_t)py * W;
         for (int px = x0; px <= x1; px++) {
-            int sx = (int)(((long)(px - x) * iw) / size);
-            if (sx >= iw) sx = iw - 1;
-            unsigned a = srow[sx * 4 + 3];
+            double fx = ((double)(px - x) + 0.5) * iw / size - 0.5;
+            if (fx < 0) fx = 0;
+            if (fx > iw - 1) fx = iw - 1;
+            int ix = (int)fx;
+            int ix1_ = ix + 1 < iw ? ix + 1 : ix;
+            double tx_ = ix1_ == ix ? 0 : fx - ix;
+            const unsigned char *p00 = r0 + (size_t)ix * 4;
+            const unsigned char *p01 = r0 + (size_t)ix1_ * 4;
+            const unsigned char *p10 = r1 + (size_t)ix * 4;
+            const unsigned char *p11 = r1 + (size_t)ix1_ * 4;
+            unsigned v[4];
+            for (int c = 0; c < 4; c++) {
+                double top = p00[c] * (1 - tx_) + p01[c] * tx_;
+                double bot = p10[c] * (1 - tx_) + p11[c] * tx_;
+                v[c] = (unsigned)(top * (1 - ty_) + bot * ty_ + 0.5);
+            }
+            unsigned a = v[3];
             if (!a)
                 continue;
-            if (a > 255 - 8)
+            if (a > 247)
                 a = 255;
-            unsigned r = srow[sx * 4], g = srow[sx * 4 + 1], b = srow[sx * 4 + 2];
             uint32_t ob = d[px];
-            unsigned orr = ((ob >> 16 & 255) * (255 - a) + r * a) / 255;
-            unsigned ogg = ((ob >>  8 & 255) * (255 - a) + g * a) / 255;
-            unsigned obb = ((ob       & 255) * (255 - a) + b * a) / 255;
+            unsigned orr = ((ob >> 16 & 255) * (255 - a) + v[0] * a) / 255;
+            unsigned ogg = ((ob >>  8 & 255) * (255 - a) + v[1] * a) / 255;
+            unsigned obb = ((ob       & 255) * (255 - a) + v[2] * a) / 255;
             d[px] = rgb(orr, ogg, obb);
         }
     }
@@ -1571,18 +1872,26 @@ static void pump_keyboard(void)
 }
 
 /* ---------------- terminal window texture rendering ---------------------- */
-/* render the window texture at (w x h); the grid is anchored top-left of the
- * body so text never stretches at the final animation states */
+/* render the window texture; the texture spans the window rect plus the
+ * baked soft-shadow margin (SMc) on every side, with rounded corners
+ * carried as per-texel alpha, so compositing never loses the shadow */
 static void render_winbuf(int w, int h)
 {
     if (!winbuf || w <= 0 || h <= 0)
         return;
-    winbuf_w = w; winbuf_h = h;
+    while (SMc > 4 && (size_t)(w + 2 * SMc) * (size_t)(h + 2 * SMc) >
+                      (size_t)W * (size_t)(H - panel_h))
+        SMc--;                                /* keep the texture in bounds */
+    int tw_ = w + 2 * SMc, th_ = h + 2 * SMc;
+    winbuf_w = tw_;
+    winbuf_h = th_;
+    memset(winbuf, 0, (size_t)tw_ * th_ * 4);
+    const int ox = SMc, oy = SMc;
 
     /* body: frosted dark glass from the pre-blurred backdrop */
     if (winblur) {
         for (int y = 0; y < h; y++) {
-            uint32_t *d = winbuf + (size_t)y * w;
+            uint32_t *d = winbuf + (size_t)(y + oy) * tw_ + ox;
             for (int x = 0; x < w; x++) {
                 int bx = x + (wx - winblur_x0);
                 int by = y + (wy - winblur_y0);
@@ -1599,8 +1908,11 @@ static void render_winbuf(int w, int h)
             }
         }
     } else {
-        for (int i = 0; i < w * h; i++)
-            winbuf[i] = rgb(22, 22, 26);
+        for (int y = 0; y < h; y++) {
+            uint32_t *d = winbuf + (size_t)(y + oy) * tw_ + ox;
+            for (int x = 0; x < w; x++)
+                d[x] = rgb(22, 22, 26);
+        }
     }
 
     /* title bar: light gradient (macOS light chrome) */
@@ -1610,13 +1922,13 @@ static void render_winbuf(int w, int h)
         unsigned r = (unsigned)(r0 + (r1 - r0) * f);
         unsigned g = (unsigned)(g0 + (g1 - g0) * f);
         unsigned b = (unsigned)(b0 + (b1 - b0) * f);
-        uint32_t *d = winbuf + (size_t)y * w;
+        uint32_t *d = winbuf + (size_t)(y + oy) * tw_ + ox;
         for (int x = 0; x < w; x++)
             d[x] = rgb(r, g, b);
     }
     /* hairline under the title bar */
     if (tw_title < h) {
-        uint32_t *d = winbuf + (size_t)tw_title * w;
+        uint32_t *d = winbuf + (size_t)(tw_title + oy) * tw_ + ox;
         for (int x = 0; x < w; x++)
             d[x] = rgb(196, 196, 200);
     }
@@ -1624,19 +1936,19 @@ static void render_winbuf(int w, int h)
     /* traffic lights */
     {
         double lr = fmax(5.5, 6.5 * u);
-        double lcy = (tw_title - 1) / 2.0 + 0.5;
-        double lx[3] = { 19 * u, 39 * u, 59 * u };
+        double lcy = oy + (tw_title - 1) / 2.0 + 0.5;
+        double lx[3] = { ox + 19 * u, ox + 39 * u, ox + 59 * u };
         uint32_t lcol[3] = { rgb(255, 95, 87), rgb(254, 188, 46), rgb(40, 200, 64) };
         for (int i = 0; i < 3; i++) {
             double ccx = lx[i], ccy = lcy;
             int x0 = (int)floor(ccx - lr - 1), x1 = (int)ceil(ccx + lr + 1);
             int y0 = (int)floor(ccy - lr - 1), y1 = (int)ceil(ccy + lr + 1);
+            if (x0 < 0) x0 = 0;
+            if (y0 < 0) y0 = 0;
+            if (x1 > tw_ - 1) x1 = tw_ - 1;
+            if (y1 > th_ - 1) y1 = th_ - 1;
             for (int y = y0; y <= y1; y++) {
-                if (y < 0 || y >= h)
-                    continue;
                 for (int x = x0; x <= x1; x++) {
-                    if (x < 0 || x >= w)
-                        continue;
                     double dx = x + 0.5 - ccx, dy = y + 0.5 - ccy;
                     double cov = 0.5 + lr - sqrt(dx * dx + dy * dy);
                     if (cov <= 0)
@@ -1644,124 +1956,144 @@ static void render_winbuf(int w, int h)
                     if (cov > 1)
                         cov = 1;
                     int a = (int)(cov * 255 + 0.5);
-                    uint32_t ob = winbuf[(size_t)y * w + x];
+                    uint32_t ob = winbuf[(size_t)y * tw_ + x];
                     unsigned orr = ((ob >> 16 & 255) * (255 - a) + (lcol[i] >> 16 & 255) * a) / 255;
                     unsigned ogg = ((ob >>  8 & 255) * (255 - a) + (lcol[i] >>  8 & 255) * a) / 255;
                     unsigned obb = ((ob       & 255) * (255 - a) + (lcol[i]       & 255) * a) / 255;
-                    winbuf[(size_t)y * w + x] = rgb(orr, ogg, obb);
+                    winbuf[(size_t)y * tw_ + x] = rgb(orr, ogg, obb);
                 }
             }
         }
     }
 
-    /* title text, centered in the title bar */
+    /* title text, centered in the title bar (proportional UI font) */
     {
         const char *tstr = tm_dead ? TERM_DONE : TERM_TITLE;
-        int len = 0;
-        while (tstr[len]) len++;
-        int tx = (w - len * FONT_W) / 2;
-        int ty = (tw_title - FONT_H) / 2;
-        for (int i = 0; tstr[i]; i++) {
-            char ch = tstr[i];
-            if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
-                continue;
-            const unsigned char (*gl)[FONT_W] =
-                (const unsigned char (*)[FONT_W])FONT_BITMAP[ch - FONT_FIRST];
-            for (int ry = 0; ry < FONT_H; ry++) {
-                int py = ty + ry;
-                if (py < 0 || py >= tw_title || py >= h)
-                    continue;
-                const unsigned char *row = gl[ry];
-                uint32_t *d = winbuf + (size_t)py * w;
-                for (int rx = 0; rx < FONT_W; rx++) {
-                    int a = row[rx];
-                    if (!a)
-                        continue;
-                    int px = tx + i * FONT_W + rx;
-                    if (px < 0 || px >= w)
-                        continue;
-                    uint32_t ob = d[px];
-                    unsigned rr = ((ob >> 16 & 255) * (255 - a) + 110 * a) / 255;
-                    unsigned gg = ((ob >>  8 & 255) * (255 - a) + 110 * a) / 255;
-                    unsigned bb = ((ob       & 255) * (255 - a) + 116 * a) / 255;
-                    d[px] = rgb(rr, gg, bb);
+        int tx = ox + (w - ui_text_w(tstr, 0)) / 2;
+        int ty = oy + (tw_title - UIF_CELLH) / 2;
+        if (ty < oy)
+            ty = oy;
+        ui_text_tex(winbuf, tw_, th_, tx, ty, tstr, rgb(110, 110, 116), 0);
+    }
+
+    /* rounded corners: rewrite the alpha channel of the 4 corner boxes */
+    {
+        int r = (int)(WIN_R * u);
+        if (r > w / 2) r = w / 2;
+        if (r > h / 2) r = h / 2;
+        for (int cyy = 0; cyy < 2; cyy++) {
+            int by0 = cyy ? oy + h - r : oy;
+            for (int cxx = 0; cxx < 2; cxx++) {
+                int bx0 = cxx ? ox + w - r : ox;
+                for (int y = 0; y < r; y++) {
+                    uint32_t *d = winbuf + (size_t)(by0 + y) * tw_;
+                    for (int x = 0; x < r; x++) {
+                        double dd = sd_round(bx0 + x + 0.5, by0 + y + 0.5,
+                                             ox, oy, ox + w - 1, oy + h - 1,
+                                             (double)r);
+                        double cov = 0.5 - dd;
+                        if (cov >= 1)
+                            continue;
+                        uint32_t *p = &d[bx0 + x];
+                        if (cov <= 0)
+                            *p = 0;
+                        else
+                            *p = ((uint32_t)(cov * 255.0 + 0.5) << 24) |
+                                 (*p & 0xFFFFFF);
+                    }
                 }
             }
         }
     }
 
-    (void)w; (void)h;
+    /* baked soft shadow in the margin ring around the window */
+    {
+        double sig = 10.0 * u, amax = 58.0;
+        double rr = (WIN_R - 2) * u;
+        if (rr < 2)
+            rr = 2;
+        for (int y = 0; y < th_; y++) {
+            uint32_t *d = winbuf + (size_t)y * tw_;
+            for (int x = 0; x < tw_; x++) {
+                if (x >= ox && x < ox + w && y >= oy && y < oy + h)
+                    continue;                 /* window area is opaque */
+                double dd = sd_round(x + 0.5, y + 0.5, ox, oy,
+                                     ox + w - 1, oy + h - 1, rr);
+                if (dd < 0 || dd > SMc)
+                    continue;
+                int A = (int)(amax * exp(-dd / sig) + 0.5);
+                if (A < 2)
+                    continue;
+                if (A > 255) A = 255;
+                d[x] = (uint32_t)A << 24;     /* neutral black, alpha only */
+            }
+        }
+    }
 }
 
-/* rounded-corner 1:1 blit of `tex` over `back`; pixels outside the
- * rounded rect keep what was in `back` (so the window looks rounded) */
-static void tex_blit_round(const uint32_t *tex, int tx, int ty, int tw, int th,
-                           int alpha)
+/* blend an RGBA texture (alpha in the top byte) over `back`, clipped to
+ * the global clip rect; galpha 256 = full strength */
+static void tex_blit_alpha(const uint32_t *tex, int tx, int ty, int tw_, int th_,
+                           int galpha)
 {
     int x0 = tx < cx0 ? cx0 : tx;
     int y0 = ty < cy0 ? cy0 : ty;
-    int x1 = tx + tw - 1 > cx1 ? cx1 : tx + tw - 1;
-    int y1 = ty + th - 1 > cy1 ? cy1 : ty + th - 1;
-    int r = (int)(WIN_R * u);
+    int x1 = tx + tw_ - 1 > cx1 ? cx1 : tx + tw_ - 1;
+    int y1 = ty + th_ - 1 > cy1 ? cy1 : ty + th_ - 1;
     for (int y = y0; y <= y1; y++) {
-        const uint32_t *s = tex + (size_t)(y - ty) * tw + (x0 - tx);
+        const uint32_t *s = tex + (size_t)(y - ty) * tw_ + (x0 - tx);
         uint32_t *d = back + (size_t)y * W + x0;
-        int in_top = y - ty < r, in_bot = ty + th - 1 - y < r;
-        if (alpha >= 256 && !in_top && !in_bot) {
-            memcpy(d, s, (size_t)(x1 - x0 + 1) * 4);
-            continue;
-        }
         for (int x = 0; x <= x1 - x0; x++) {
-            if (in_top || in_bot) {
-                double dd = sd_round(x0 + x + 0.5, y + 0.5, tx, ty,
-                                     tx + tw - 1, ty + th - 1, r);
-                if (dd > 0)
-                    continue;
+            unsigned ta = s[x] >> 24;
+            if (!ta)
+                continue;
+            if (ta == 255 && galpha >= 256) {
+                d[x] = s[x];
+                continue;
             }
-            uint32_t v = d[x], w = s[x];
-            unsigned rr = ((v >> 16 & 255) * (256 - alpha) + (w >> 16 & 255) * alpha) >> 8;
-            unsigned gg = ((v >>  8 & 255) * (256 - alpha) + (w >>  8 & 255) * alpha) >> 8;
-            unsigned bb = ((v       & 255) * (256 - alpha) + (w       & 255) * alpha) >> 8;
-            d[x] = rgb(rr, gg, bb);
+            int a = galpha >= 256 ? (int)ta : (int)(((unsigned)ta * (unsigned)galpha) >> 8);
+            uint32_t w = s[x] & 0xFFFFFF;
+            uint32_t v = d[x];
+            unsigned r = ((v >> 16 & 255) * (255 - a) + (w >> 16 & 255) * a) / 255;
+            unsigned g = ((v >>  8 & 255) * (255 - a) + (w >>  8 & 255) * a) / 255;
+            unsigned b = ((v       & 255) * (255 - a) + (w       & 255) * a) / 255;
+            d[x] = rgb(r, g, b);
         }
     }
 }
 
-/* soft drop shadow around a rect (macOS-like) */
-static void draw_shadow(int x0, int y0, int x1, int y1)
+/* nearest-neighbour RGBA-scaled blend of `tex` into an arbitrary dst rect
+ * (window animations: the texture carries shadow + rounded corners) */
+static void tex_blit_scaled_alpha(const uint32_t *tex, int tw_, int th_,
+                                  int dx0, int dy0, int dx1, int dy1, int alpha)
 {
-    double margin = 22 * u;
-    double sigma = 10 * u;
-    double amax = 58;
-    int ex0 = (int)floor(x0 - margin), ex1 = (int)ceil(x1 + margin);
-    int ey0 = (int)floor(y0 - margin), ey1 = (int)ceil(y1 + margin);
-    if (ex0 < 0) ex0 = 0;
-    if (ey0 < 0) ey0 = 0;
-    if (ex1 > W - 1) ex1 = W - 1;
-    if (ey1 > H - 1) ey1 = H - 1;
-    for (int y = ey0; y <= ey1; y++) {
-        if (y < cy0 || y > cy1)
-            continue;
-        for (int x = ex0; x <= ex1; x++) {
-            if (x < cx0 || x > cx1)
+    if (dx1 < dx0 || dy1 < dy0 || tw_ <= 0 || th_ <= 0)
+        return;
+    int dw = dx1 - dx0 + 1, dh = dy1 - dy0 + 1;
+    int x0 = dx0 < cx0 ? cx0 : dx0;
+    int y0 = dy0 < cy0 ? cy0 : dy0;
+    int x1 = dx1 > cx1 ? cx1 : dx1;
+    int y1 = dy1 > cy1 ? cy1 : dy1;
+    for (int y = y0; y <= y1; y++) {
+        int sy = (int)(((long)(y - dy0) * th_) / dh);
+        if (sy >= th_) sy = th_ - 1;
+        const uint32_t *srow = tex + (size_t)sy * tw_;
+        uint32_t *d = back + (size_t)y * W;
+        for (int x = x0; x <= x1; x++) {
+            int sx = (int)(((long)(x - dx0) * tw_) / dw);
+            if (sx >= tw_) sx = tw_ - 1;
+            unsigned ta = srow[sx] >> 24;
+            if (!ta)
                 continue;
-            if (x >= x0 && x <= x1 && y >= y0 && y <= y1)
+            int a = (int)(((unsigned)ta * (unsigned)alpha) >> 8);
+            if (!a)
                 continue;
-            double d = sd_round(x + 0.5, y + 0.5, x0, y0, x1, y1, (WIN_R - 2) * u);
-            if (d > margin)
-                continue;
-            if (d < 0)
-                d = 0;
-            double a = amax * exp(-d / sigma);
-            if (a < 1.5)
-                continue;
-            int A = (int)(a + 0.5);
-            if (A > 255) A = 255;
-            uint32_t ob = back[(size_t)y * W + x];
-            unsigned rr = ((ob >> 16 & 255) * (255 - A)) / 255;
-            unsigned gg = ((ob >>  8 & 255) * (255 - A)) / 255;
-            unsigned bb = ((ob       & 255) * (255 - A)) / 255;
-            back[(size_t)y * W + x] = rgb(rr, gg, bb);
+            uint32_t w = srow[sx] & 0xFFFFFF;
+            uint32_t v = d[x];
+            unsigned r = ((v >> 16 & 255) * (255 - a) + (w >> 16 & 255) * a) / 255;
+            unsigned g = ((v >>  8 & 255) * (255 - a) + (w >>  8 & 255) * a) / 255;
+            unsigned b = ((v       & 255) * (255 - a) + (w       & 255) * a) / 255;
+            d[x] = rgb(r, g, b);
         }
     }
 }
@@ -1809,16 +2141,17 @@ static void draw_term_content(int wx0, int wy0)
             }
         }
     }
-    /* caret: solid light block at the cursor cell */
+    /* caret: thin light bar at the cursor cell (macOS-style) */
     if (caret_on) {
         int px0 = gx + tcx * FONT_W;
         int py0 = gy + tcy * FONT_H;
+        int cw = FONT_W >= 8 ? 2 : 1;
         for (int ry = 0; ry < FONT_H; ry++) {
             int py = py0 + ry;
             if (py < cy0 || py > cy1)
                 continue;
             uint32_t *d = back + (size_t)py * W;
-            for (int rx = 0; rx < FONT_W; rx++) {
+            for (int rx = 0; rx < cw; rx++) {
                 int px = px0 + rx;
                 if (px < cx0 || px > cx1)
                     continue;
@@ -1837,12 +2170,10 @@ static int A_tx0, A_ty0, A_tx1, A_ty1;   /* to rect                       */
 static int A_fa, A_ta;                   /* from/to alpha                 */
 static enum TmSt A_end = TM_CLOSED;      /* state after animation         */
 static bool A_zoom = false;              /* zoomed after animation        */
-static int A_bufw, A_bufh;               /* winbuf dims during animation  */
 static bool tm_zoomed = false;
 static int force_x0, force_y0, force_x1, force_y1;   /* post-anim repaint  */
 static bool force_dirty = false;
 static bool force_full = false;         /* wipe the whole screen once   */
-static bool g_full = false;             /* full repaint in this frame   */
 
 static void win_norm_rect(int *x0, int *y0, int *x1, int *y1)
 {
@@ -1882,14 +2213,12 @@ static bool win_cur_rect(int *x0, int *y0, int *x1, int *y1, int *alpha)
 
 static void anim_start(enum TmSt end, bool zoom,
                        int fx0, int fy0, int fx1, int fy1, int fa,
-                       int tx0, int ty0, int tx1, int ty1, int ta,
-                       int bufw, int bufh)
+                       int tx0, int ty0, int tx1, int ty1, int ta)
 {
     A_end = end;
     A_zoom = zoom;
     A_fx0 = fx0; A_fy0 = fy0; A_fx1 = fx1; A_fy1 = fy1; A_fa = fa;
     A_tx0 = tx0; A_ty0 = ty0; A_tx1 = tx1; A_ty1 = ty1; A_ta = ta;
-    A_bufw = bufw; A_bufh = bufh;
     tm_anim = true;
     tm_t0 = now();
 }
@@ -1902,7 +2231,7 @@ static void anim_update(void)
     if (t < 1.0)
         return;
     /* force a repaint of the whole 'from' region so no animation frame
-     * can leave ghost pixels behind */
+     * can leave ghost pixels behind (SMc covers the baked shadow) */
     force_x0 = A_fx0; force_y0 = A_fy0;
     force_x1 = A_fx1; force_y1 = A_fy1;
     force_dirty = true;
@@ -1933,8 +2262,7 @@ static void win_open(void)
     icon_rect(1.0, &ix0, &iy0, &ix1, &iy1);
     anim_start(TM_OPEN, false,
                ix0, iy0, ix1, iy1, 40,
-               wx, wy, wx + ww - 1, wy + wh - 1, 256,
-               ww, wh);
+               wx, wy, wx + ww - 1, wy + wh - 1, 256);
 }
 
 static void win_close_start(void)
@@ -1951,8 +2279,7 @@ static void win_close_start(void)
         win_norm_rect(&a, &b, &c, &d);
     anim_start(TM_CLOSED, false,
                a, b, c, d, 256,
-               ix0, iy0, ix1, iy1, 0,
-               c - a + 1, d - b + 1);
+               ix0, iy0, ix1, iy1, 0);
 }
 
 static void win_minimize(void)
@@ -1969,8 +2296,7 @@ static void win_minimize(void)
         win_norm_rect(&a, &b, &c, &d);
     anim_start(TM_MINIMIZED, tm_zoomed,
                a, b, c, d, 256,
-               ix0, iy0, ix1, iy1, 0,
-               c - a + 1, d - b + 1);
+               ix0, iy0, ix1, iy1, 0);
 }
 
 static void win_restore(void)
@@ -1983,8 +2309,7 @@ static void win_restore(void)
     icon_rect(1.0, &ix0, &iy0, &ix1, &iy1);
     anim_start(TM_OPEN, false,
                ix0, iy0, ix1, iy1, 0,
-               wx, wy, wx + ww - 1, wy + wh - 1, 256,
-               ww, wh);
+               wx, wy, wx + ww - 1, wy + wh - 1, 256);
 }
 
 static void win_zoom(void)
@@ -1997,39 +2322,34 @@ static void win_zoom(void)
         win_max_rect(&a, &b, &c, &d);
         anim_start(TM_OPEN, true,
                    wx, wy, wx + ww - 1, wy + wh - 1, 256,
-                   a, b, c, d, 256,
-                   ww, wh);
+                   a, b, c, d, 256);
     } else {
         win_norm_rect(&a, &b, &c, &d);
         int mx0, my0, mx1, my1;
         win_max_rect(&mx0, &my0, &mx1, &my1);
         anim_start(TM_OPEN, false,
                    mx0, my0, mx1, my1, 256,
-                   a, b, c, d, 256,
-                   mx1 - mx0 + 1, my1 - my0 + 1);
+                   a, b, c, d, 256);
     }
 }
 
 /* ---------------- window drawing ----------------------------------------- */
+/* the texture already carries the shadow and the rounded corners as
+ * per-texel alpha, so every dirty-rect repaint restores both correctly */
 static void draw_window(void)
 {
     int x0, y0, x1, y1, alpha;
     if (!win_cur_rect(&x0, &y0, &x1, &y1, &alpha))
         return;
-    if ((tm_anim || g_full) && alpha >= 250)
-        draw_shadow(x0, y0, x1, y1);          /* otherwise it is already on screen */
-    int bw = A_bufw, bh = A_bufh;             /* dims the texture was built for */
-    if (!tm_anim) {
-        bw = x1 - x0 + 1;
-        bh = y1 - y0 + 1;
+    if (!tm_anim && alpha >= 256 &&
+        winbuf_w == (x1 - x0 + 1) + 2 * SMc &&
+        winbuf_h == (y1 - y0 + 1) + 2 * SMc) {
+        tex_blit_alpha(winbuf, x0 - SMc, y0 - SMc, winbuf_w, winbuf_h, 256);
+        draw_term_content(x0, y0);
+        return;
     }
-    if (bw == x1 - x0 + 1 && bh == y1 - y0 + 1) {
-        tex_blit_round(winbuf, x0, y0, bw, bh, alpha);
-        if (!tm_anim)
-            draw_term_content(x0, y0);        /* text lives only on screen */
-    } else {
-        tex_blit_scaled(winbuf, bw, bh, x0, y0, x1, y1, alpha);
-    }
+    tex_blit_scaled_alpha(winbuf, winbuf_w, winbuf_h,
+                          x0 - SMc, y0 - SMc, x1 + SMc, y1 + SMc, alpha);
 }
 
 /* ---------------- mouse --------------------------------------------------- */
@@ -2129,12 +2449,22 @@ static void handle_click(int x, int y)
     if (!in_desktop)
         return;
 
+    /* About panel: any click dismisses it */
+    if (about_open) {
+        about_open = false;
+        about_dirty = true;
+        return;
+    }
+
     /* menu takes priority while open; any click closes it (macOS behaviour) */
     if (menu_open) {
         double e = menu_a * menu_a * (3 - 2 * menu_a);
-        int oy = (int)((1.0 - e) * -14 * u);
+        int oy = (int)((1.0 - e) * -10 * u);
         if (in_rect(x, y, it_x0, it_y0 + oy, it_x1, it_y1 + oy)) {
-            /* "About" intentionally does nothing */
+            fprintf(stderr, "ACT about\n");
+            render_about_tex();
+            about_open = true;
+            about_dirty = true;
         }
         menu_open = false;
         menu_closing = true;
@@ -2174,10 +2504,14 @@ static void handle_click(int x, int y)
         }
     }
 
-    if (in_rect(x, y, ti_x0, ti_y0, ti_x1, ti_y1)) {
-        fprintf(stderr, "HIT menu title\n");
+    /* droplet logo or the Settings item open the menu */
+    if (in_rect(x, y, dr_x0 - 3, dr_y0 - 3, dr_x1 + 3, dr_y1 + 3) ||
+        in_rect(x, y, ti_x0, ti_y0, ti_x1, ti_y1)) {
+        fprintf(stderr, "HIT menu\n");
+        render_menu_tex();
         menu_open = true;
         menu_closing = false;
+        return;
     }
     fprintf(stderr, "MISS (%d,%d)\n", x, y);
 }
@@ -2217,7 +2551,9 @@ static void scene_render(int x0, int y0, int x1, int y1)
     draw_dock_icon();
     draw_window();
     draw_menu_animated();
+    draw_about();
     draw_fps(1);
+    draw_clock(1);
     draw_cursor();
     blit_rect(cx0, cy0, cx1, cy1);
 }
@@ -2399,6 +2735,7 @@ int main(void)
                 keyq_n = 0;
             }
             dock_update(dt);
+            clock_update();
 
             /* menu dropdown animation */
             if (menu_open) {
@@ -2427,7 +2764,7 @@ int main(void)
                 force_full = false;
             } else {
                 if (force_dirty) {
-                    int m = (int)(44 * u);
+                    int m = SMc + (int)(18 * u);
                     add_rect(force_x0 - m, force_y0 - m, force_x1 + m, force_y1 + m);
                     force_dirty = false;
                 }
@@ -2455,8 +2792,9 @@ int main(void)
                     add_rect(ti_x0 - 2, ti_y0, ti_x1 + 2, ti_y1);
                     if (menu_a > 0.001) {
                         double e = menu_a * menu_a * (3 - 2 * menu_a);
-                        int oy = (int)((1.0 - e) * -14 * u);
-                        add_rect(dd_x0 - 4, dd_y0 + oy - 6, dd_x1 + 6, dd_y1 + 8);
+                        int oy = (int)((1.0 - e) * -10 * u);
+                        add_rect(dd_x0 - DDMc - 2, dd_y0 + oy - DDMc - 2,
+                                 dd_x1 + DDMc + 2, dd_y1 + oy + DDMc + 2);
                     }
                 }
                 hover_prev = hover;
@@ -2471,36 +2809,38 @@ int main(void)
                     dock_dot_drawn = dot_on;
                 }
 
-                /* terminal window */
+                /* terminal window (texture includes the baked shadow) */
                 if ((tm != TM_CLOSED && tm != TM_MINIMIZED) || tm_anim) {
                     int a, b, c, d, al;
                     if (win_cur_rect(&a, &b, &c, &d, &al)) {
-                        int m = (int)(40 * u);
+                        int m = SMc + 2;
                         if (tm_anim) {
-                            add_rect(A_fx0 - m, A_fy0 - m, A_fx1 + m, A_fy1 + m);
-                            add_rect(A_tx0 - m, A_ty0 - m, A_tx1 + m, A_ty1 + m);
+                            int am = SMc + (int)(18 * u);
+                            add_rect(A_fx0 - am, A_fy0 - am, A_fx1 + am, A_fy1 + am);
+                            add_rect(A_tx0 - am, A_ty0 - am, A_tx1 + am, A_ty1 + am);
                         } else {
                             static int px0 = -1, py0 = -1, px1 = -1, py1 = -1;
                             if (term_dirty ||
                                 a != px0 || b != py0 || c != px1 || d != py1) {
-                                add_rect(a - 2, b - 2, c + 2, d + 2);
+                                add_rect(a - m, b - m, c + m, d + m);
                                 px0 = a; py0 = b; px1 = c; py1 = d;
                             }
-                            if (mx >= a - 4 && mx <= c + 4 && my >= b - 4 && my <= d + 4 &&
-                                (mx != pmx || my != pmy))
-                                add_rect(a - 2, b - 2, c + 2, d + 2);
                         }
                         term_dirty = false;
                     }
                 }
+
+                /* About panel (repaint fully on open/close) */
+                if (about_dirty) {
+                    add_rect(ab_x0 - AMDc - 2, ab_y0 - AMDc - 2,
+                             ab_x1 + AMDc + 2, ab_y1 + AMDc + 2);
+                    about_dirty = false;
+                }
             }
             scene_invalid = false;
 
-            g_full = drn == 1 && dr[0].x0 == 0 && dr[0].y0 == 0 &&
-                     dr[0].x1 == W - 1 && dr[0].y1 == H - 1;
             for (int i = 0; i < drn; i++)
                 scene_render(dr[i].x0, dr[i].y0, dr[i].x1, dr[i].y1);
-            g_full = false;
         }
 
         if (!ready) {
