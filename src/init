@@ -5,6 +5,8 @@
 
 /bin/busybox --install -s
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export TZ=MSK-3
+# Europe/Moscow time (MSK, UTC+3, no DST) for splash, shell and busybox date.
 
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys

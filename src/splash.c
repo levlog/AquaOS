@@ -1,5 +1,5 @@
 /*
- * AquaOS boot splash / desktop shell (v4).
+ * AquaOS boot splash / desktop shell (v7).
  *
  * Renders directly on the Linux framebuffer (/dev/fb0):
  *   - boot:        live kernel log lines (from /dev/kmsg, real records) in the
@@ -20,6 +20,7 @@
  * actually composed, the terminal runs a real shell.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -106,25 +107,56 @@ static double u;          /* linear unit scale, H/768                  */
 
 /* mouse / menu / cursor state */
 static int mouse_fd = -1;
+static int wheel_fd = -1; /* evdev device carrying REL_WHEEL, or -1    */
 static int vt_fd = -1;    /* /dev/tty0 kept open in KD_GRAPHICS mode    */
 static double mouse_try = 0;
+static double wheel_try = 0;
 static int mx, my;        /* cursor position, hotspot at the tip       */
 static int pmx, pmy;      /* cursor position on the previous frame     */
 static int btn_l;         /* left button state                         */
 static double last_clk = -1;  /* click debounce timer                      */
+
+/* ---- macOS-style menu bar: several menus with working items ---- */
+#define NMENUS 3
+static const char *const mtitle[NMENUS] = { "Settings", "File", "Window" };
+static const bool mtitle_bold[NMENUS] = { true, false, false };
+#define MITEMS_MAX 4
+static const char *const mitems[NMENUS][MITEMS_MAX] = {
+    { "About AquaOS", NULL, NULL, NULL },
+    { "New Window", "Close Window", NULL, NULL },
+    { "Minimize", "Zoom", NULL, NULL },
+};
 static bool menu_open = false;
-static double menu_a = 0; /* dropdown animation 0..1                   */
+static int menu_idx = -1;         /* which title's dropdown is open      */
+static double menu_a = 0;         /* dropdown animation 0..1             */
 static bool menu_closing = false;
 static bool in_desktop = false;
-static int ti_x0, ti_y0, ti_x1, ti_y1;   /* "Settings" item rect       */
-static int dr_x0, dr_y0, dr_x1, dr_y1;   /* droplet logo rect          */
-static int set_x;                        /* "Settings" text x          */
-static int dd_x0, dd_y0, dd_x1, dd_y1;   /* dropdown rect              */
-static int it_x0, it_y0, it_x1, it_y1;   /* "About AquaOS" item rect   */
+static int tr[NMENUS][4];                 /* title bar item rects        */
+static int dr_x0, dr_y0, dr_x1, dr_y1;    /* droplet logo rect           */
+static int dd_x0, dd_y0, dd_x1, dd_y1;    /* open dropdown rect          */
+static int it_x0, it_y0, it_x1, it_y1;    /* open item strip (vertical)  */
+static int it_r[MITEMS_MAX][4];           /* per-item rects (open menu)  */
 
-/* macOS menu bar clock (real system time, HH:MM) */
+/* window dragging (macOS-style, by the title bar) */
+static bool dragging = false;
+static int drag_gx, drag_gy;              /* grab offset inside window   */
+static double last_title_clk = -1;        /* double-click detector       */
+static uint32_t *lift_tex = NULL;         /* extra "lift" shadow in drag */
+static int lift_tex_w, lift_tex_h;
+
+/* macOS menu bar clock (real system time) */
 static char clk_str[8];
+static char dat_str[16];
 static bool clk_valid = false;
+
+/* battery / power (real values from /sys/class/power_supply; without a
+ * battery the system is on external power - shown as full + bolt) */
+static int bat_pct = -1;                  /* -1 = unknown hardware       */
+static bool bat_charging = false;
+static bool bat_full = false;
+static bool ac_online = false;
+static double bat_next = 0;
+static int bat_drawn = -2;                /* last painted state          */
 
 /* About panel (real data only: kernel, framebuffer, uptime, fps) */
 static bool about_open = false;
@@ -136,6 +168,7 @@ static char kver[48];          /* kernel release, parsed from real kmsg */
 static uint32_t *menu_tex;
 static int menu_tex_w, menu_tex_h;
 static int DDMc;                          /* dropdown shadow margin     */
+static int menu_tex_alloc_w, menu_tex_alloc_h;
 static uint32_t *about_tex;
 static int about_tex_w, about_tex_h;
 static int AMDc;                          /* About shadow margin        */
@@ -364,6 +397,43 @@ static double sd_round(double px, double py,
     return sqrt(ax * ax + ay * ay) + fmin(fmax(qx, qy), 0.0) - r;
 }
 
+/* Bake a macOS-style soft shadow ring into an ARGB texture (alpha only).
+ * The shadow follows the rounded silhouette with the same radius as the
+ * window corners, is gently biased downwards (like macOS), and fades out
+ * fully before the margin edge so no rectangular cut-off can ever show. */
+static void bake_shadow_ring(uint32_t *tex, int tw_, int th_,
+                             int ox, int oy, int w, int h,
+                             double rad, double sig, double amax, double offy)
+{
+    double edge_w = 2.5;
+    int M = tw_ - ox - w;                     /* margin on the right side */
+    for (int y = 0; y < th_; y++) {
+        uint32_t *d = tex + (size_t)y * tw_;
+        for (int x = 0; x < tw_; x++) {
+            if (x >= ox && x < ox + w && y >= oy && y < oy + h)
+                continue;                     /* window area is untouched */
+            double dd = sd_round(x + 0.5, y + 0.5 - offy, ox, oy,
+                                 ox + w - 1, oy + h - 1, rad);
+            if (dd < 0 || dd > sig * 2.4)
+                continue;
+            double fall = exp(-dd / sig);
+            /* smooth fade to zero at the very margin (no hard cut) */
+            double dm = (double)M - dd;
+            if (dm < edge_w) {
+                if (dm <= 0)
+                    continue;
+                fall *= dm / edge_w;
+            }
+            int A = (int)(amax * fall + 0.5);
+            if (A < 2)
+                continue;
+            if (A > 255)
+                A = 255;
+            d[x] = (uint32_t)A << 24;
+        }
+    }
+}
+
 /* distance from a point to a line segment (for vector overlays) */
 static double seg_dist(double px, double py,
                        double ax, double ay, double bx, double by)
@@ -385,6 +455,7 @@ static int SMc;                   /* baked shadow margin around window    */
 static uint32_t *winblur;         /* blurred backdrop under the window    */
 static int winblur_w, winblur_h, winblur_x0, winblur_y0;
 static int mw_x0, mw_y0, mw_x1, mw_y1;   /* maximized ("zoomed") rect     */
+static int prx0 = -1, pry0 = -1, prx1 = -1, pry1 = -1;  /* prev win rect */
 
 /* terminal states */
 enum TmSt { TM_CLOSED, TM_OPENING, TM_OPEN, TM_MINIMIZING, TM_MINIMIZED,
@@ -392,19 +463,28 @@ enum TmSt { TM_CLOSED, TM_OPENING, TM_OPEN, TM_MINIMIZING, TM_MINIMIZED,
 static enum TmSt tm = TM_CLOSED;
 static bool tm_dead = false;      /* shell exited                         */
 static bool caret_on = true;      /* caret blink phase                    */
+static bool caret_dirty = false;  /* caret cell needs a repaint           */
+static int carect[4];             /* caret cell rect                      */
+static bool extra_dirty = false;  /* one-shot extra repaint rect          */
+static int extra_rect[4];
 
-#define ANIM_MS   0.20            /* window animation duration, s         */
-#define MENU_MS   0.15            /* dropdown animation duration, s       */
+#define ANIM_MS   0.24            /* window animation duration, s         */
+#define MENU_MS   0.17            /* dropdown animation duration, s       */
 
 /* ---------------- desktop panel --------------------------------------- */
+static int ui_text_w(const char *s, int bold);   /* defined below */
+static bool tm_anim;                     /* window animation in flight    */
+
 static void build_desktop(void)
 {
-    panel_h = (int)fmax(26.0, 28.0 * u);      /* slim macOS menu bar */
+    panel_h = (int)fmax(25.0, 25.0 * u);      /* slim macOS menu bar */
     if (panel_h > H / 4)
         panel_h = H / 4;
-    SMc = (int)(22 * u);                      /* window shadow margin */
-    DDMc = (int)(16 * u);                     /* dropdown shadow margin */
-    AMDc = (int)(16 * u);                     /* About panel shadow margin */
+    SMc = (int)(26 * u);                      /* window shadow margin */
+    if (SMc < 18)
+        SMc = 18;
+    DDMc = (int)(20 * u);                     /* dropdown shadow margin */
+    AMDc = (int)(20 * u);                     /* About panel shadow margin */
     desktop = malloc((size_t)W * H * 4);
     if (!desktop)
         return;
@@ -423,14 +503,14 @@ static void build_desktop(void)
             for (int i = 0; i < W * panel_h; i++)
                 s1[i] = rgb(200, 200, 205);   /* fallback strip */
         }
-        box_blur_h(s2, s1, W, panel_h, 14);
-        box_blur_v(s1, s2, W, panel_h, 3);
-        /* frosted glass: lighten towards white (58%) */
+        box_blur_h(s2, s1, W, panel_h, 16);
+        box_blur_v(s1, s2, W, panel_h, 4);
+        /* frosted glass: 53% blurred wallpaper + 47% white (macOS-like) */
         for (int i = 0; i < W * panel_h; i++) {
             uint32_t v = s1[i];
-            unsigned r = ((v >> 16 & 255) * 107 + 255 * 148) >> 8;
-            unsigned g = ((v >>  8 & 255) * 107 + 255 * 148) >> 8;
-            unsigned b = ((v       & 255) * 107 + 255 * 148) >> 8;
+            unsigned r = ((v >> 16 & 255) * 136 + 255 * 119) >> 8;
+            unsigned g = ((v >>  8 & 255) * 136 + 255 * 119) >> 8;
+            unsigned b = ((v       & 255) * 136 + 255 * 119) >> 8;
             desktop[i] = rgb(r, g, b);
         }
     }
@@ -439,9 +519,9 @@ static void build_desktop(void)
     /* hairline along the bottom edge of the panel */
     for (int x = 0; x < W; x++) {
         uint32_t v = desktop[(size_t)(panel_h - 1) * W + x];
-        unsigned r = ((v >> 16 & 255) * 219) >> 8;
-        unsigned g = ((v >>  8 & 255) * 219) >> 8;
-        unsigned b = ((v       & 255) * 219) >> 8;
+        unsigned r = ((v >> 16 & 255) * 226) >> 8;
+        unsigned g = ((v >>  8 & 255) * 226) >> 8;
+        unsigned b = ((v       & 255) * 226) >> 8;
         desktop[(size_t)(panel_h - 1) * W + x] = rgb(r, g, b);
     }
 
@@ -555,8 +635,45 @@ static void build_desktop(void)
     free(s4);
 
     winbuf = malloc((size_t)W * (size_t)(H - panel_h) * 4);
-    menu_tex = malloc((size_t)((int)(262 * u)) * (size_t)((int)(76 * u)) * 4);
-    about_tex = malloc((size_t)((int)(372 * u)) * (size_t)((int)(226 * u)) * 4);
+
+    /* menu textures: big enough for the widest menu (items differ per menu) */
+    {
+        int mw_max = (int)(150 * u), mh_max = 0;
+        for (int m = 0; m < NMENUS; m++) {
+            int n = 0, w = 0;
+            for (int i = 0; i < MITEMS_MAX && mitems[m][i]; i++) {
+                int iw = ui_text_w(mitems[m][i], 0);
+                if (iw > w)
+                    w = iw;
+                n++;
+            }
+            w += (int)(44 * u);
+            if (w < (int)(150 * u))
+                w = (int)(150 * u);
+            int h = (int)(10 * u) + n * (int)(26 * u) + (int)(6 * u);
+            if (w > mw_max)
+                mw_max = w;
+            if (h > mh_max)
+                mh_max = h;
+        }
+        menu_tex_alloc_w = mw_max + 2 * DDMc + 2;
+        menu_tex_alloc_h = mh_max + 2 * DDMc + 2;
+        menu_tex = malloc((size_t)menu_tex_alloc_w * menu_tex_alloc_h * 4);
+    }
+    about_tex = malloc((size_t)((int)(400 * u)) * (size_t)((int)(252 * u)) * 4);
+
+    /* "lift" shadow for window dragging: same silhouette, stronger and
+     * wider than the resting shadow - the macOS picking-up feel */
+    lift_tex_w = ww + 2 * SMc;
+    lift_tex_h = wh + 2 * SMc;
+    lift_tex = malloc((size_t)lift_tex_w * lift_tex_h * 4);
+    if (lift_tex) {
+        memset(lift_tex, 0, (size_t)lift_tex_w * lift_tex_h * 4);
+        bake_shadow_ring(lift_tex, lift_tex_w, lift_tex_h,
+                         SMc, SMc, ww, wh, (double)(WIN_R * u),
+                         22.0 * u, 105.0, 6.0 * u);
+    }
+
     fprintf(stderr, "splash: desktop ready (panel %d, dock %dx%d, win %dx%d@%d,%d)\n",
             panel_h, ddx1 - ddx0 + 1, dock_h, ww, wh, wx, wy);
 }
@@ -775,19 +892,85 @@ static void ui_text_tex(uint32_t *tex, int tstride, int th_, int x, int y,
     }
 }
 
-/* ---- real clock for the menu bar (right side, macOS-like) ---- */
+/* ---- real clock for the menu bar (system time, Europe/Moscow) ---- */
+static const char *const MON_NAME[12] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+};
+
 static void clock_update(void)
 {
     time_t rt = time(NULL);
     struct tm tmb;
     if (!localtime_r(&rt, &tmb))
         return;
-    char buf[8];
+    char buf[8], dbuf[16];
     snprintf(buf, sizeof(buf), "%02d:%02d", tmb.tm_hour, tmb.tm_min);
-    if (!clk_valid || strcmp(buf, clk_str) != 0) {
+    snprintf(dbuf, sizeof(dbuf), "%s %d", MON_NAME[tmb.tm_mon % 12],
+             tmb.tm_mday);
+    if (!clk_valid || strcmp(buf, clk_str) != 0 || strcmp(dbuf, dat_str) != 0) {
         snprintf(clk_str, sizeof(clk_str), "%s", buf);
+        snprintf(dat_str, sizeof(dat_str), "%s", dbuf);
         clk_valid = true;
     }
+}
+
+/* ---- battery / power supply: real values from /sys/class/power_supply ---- */
+static bool sysfile_int(const char *base, const char *leaf, int *out)
+{
+    char p[128];
+    snprintf(p, sizeof(p), "/sys/class/power_supply/%s/%s", base, leaf);
+    FILE *f = fopen(p, "r");
+    if (!f)
+        return false;
+    int v = -1;
+    bool ok = fscanf(f, "%d", &v) == 1;
+    fclose(f);
+    if (ok)
+        *out = v;
+    return ok;
+}
+
+static void battery_poll(void)
+{
+    DIR *d = opendir("/sys/class/power_supply");
+    if (!d)
+        return;
+    int pct = -1;
+    bool charging = false, full = false, ac = false;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        if (!strncmp(e->d_name, "BAT", 3) && pct < 0) {
+            int v;
+            if (sysfile_int(e->d_name, "capacity", &v)) {
+                pct = v;
+                char p[128], st[32] = "";
+                snprintf(p, sizeof(p), "/sys/class/power_supply/%s/status",
+                         e->d_name);
+                FILE *f = fopen(p, "r");
+                if (f) {
+                    size_t n = fread(st, 1, sizeof(st) - 1, f);
+                    st[n] = 0;
+                    fclose(f);
+                }
+                if (strstr(st, "Charg"))
+                    charging = true;
+                if (strstr(st, "Full"))
+                    full = true;
+            }
+        } else if (e->d_name[0] == 'A') {
+            int v;
+            if (sysfile_int(e->d_name, "online", &v) && v == 1)
+                ac = true;
+        }
+    }
+    closedir(d);
+    bat_pct = pct;
+    bat_charging = charging;
+    bat_full = full;
+    ac_online = ac;
 }
 
 /* anti-aliased rounded rect: fill (border=0) or 1px edge band */
@@ -923,7 +1106,7 @@ static void cursor_init(void)
         { 7.11, 17.6 }, { 4.89, 12.4 }, { 9.33, 12.4 },
     };
     const int NP = (int)(sizeof(P) / sizeof(P[0]));
-    const double SC = 1.55;
+    const double SC = 1.18;                   /* compact macOS cursor */
     cur_w = (int)ceil(9.33 * SC) + 2;
     cur_h = (int)ceil(18.4 * SC) + 2;
     cur_alpha_w = calloc((size_t)cur_w * cur_h, 1);
@@ -995,15 +1178,104 @@ static void draw_cursor(void)
     }
 }
 
-/* live FPS readout, top-right corner (inside the panel on the desktop) */
+/* live status readout, top-right corner (inside the panel on the desktop):
+ * FPS counter, battery icon, date and time - macOS status area layout */
+static int bat_icon_w(void) { return (int)(25 * u); }
+
 static void fps_bbox(int *bx0, int *by0, int *bx1, int *by1)
 {
-    int tw = ui_text_w("999 FPS", 0) + 14 + ui_text_w("23:59", 0);
+    int tw = ui_text_w("999 FPS", 0) + 12 + bat_icon_w() + 12 +
+             ui_text_w("Sep 30", 0) + 10 + ui_text_w("23:59", 0);
     *bx1 = W - 12 + 4;
     *bx0 = *bx1 - tw - 8;
     *by0 = (panel_h - UIF_CELLH) / 2 - 2;
     if (*by0 < 0) *by0 = 0;
     *by1 = panel_h - 1;
+}
+
+/* filled anti-aliased triangle (barycentric) - for the battery bolt */
+static void paint_tri(double x0, double y0, double x1, double y1,
+                      double x2, double y2, uint32_t col, int A)
+{
+    int px0 = (int)floor(fmin(x0, fmin(x1, x2))) - 1;
+    int px1 = (int)ceil(fmax(x0, fmax(x1, x2))) + 1;
+    int py0 = (int)floor(fmin(y0, fmin(y1, y2))) - 1;
+    int py1 = (int)ceil(fmax(y0, fmax(y1, y2))) + 1;
+    if (px0 < 0) px0 = 0;
+    if (py0 < 0) py0 = 0;
+    if (px1 > W - 1) px1 = W - 1;
+    if (py1 > H - 1) py1 = H - 1;
+    double ar = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (fabs(ar) < 1e-9)
+        return;
+    int cr = col >> 16 & 255, cg = col >> 8 & 255, cb = col & 255;
+    for (int y = py0; y <= py1; y++) {
+        if (y < cy0 || y > cy1)
+            continue;
+        for (int x = px0; x <= px1; x++) {
+            if (x < cx0 || x > cx1)
+                continue;
+            double fx = x + 0.5, fy = y + 0.5;
+            double w0 = ((x1 - fx) * (y2 - fy) - (x2 - fx) * (y1 - fy)) / ar;
+            double w1 = ((x2 - fx) * (y0 - fy) - (x0 - fx) * (y2 - fy)) / ar;
+            double w2 = 1.0 - w0 - w1;
+            if (w0 < 0 || w1 < 0 || w2 < 0)
+                continue;
+            double cov = fmin(1.0, fmin(w0, fmin(w1, w2)) * 4.0);
+            int a = (int)(cov * A + 0.5);
+            if (a <= 0)
+                continue;
+            uint32_t ob = back[(size_t)y * W + x];
+            unsigned rr = ((ob >> 16 & 255) * (255 - a) + cr * a) / 255;
+            unsigned gg = ((ob >>  8 & 255) * (255 - a) + cg * a) / 255;
+            unsigned bb = ((ob       & 255) * (255 - a) + cb * a) / 255;
+            back[(size_t)y * W + x] = rgb(rr, gg, bb);
+        }
+    }
+}
+
+/* neat macOS-like battery: rounded outline, proportional fill, nub, and a
+ * tiny bolt when running on external/charging power */
+static void draw_battery(int x_right, int cy, bool dark)
+{
+    double w_ = 21 * u, h_ = 10.5 * u;
+    double x0 = x_right - bat_icon_w() + 2;
+    double y0 = cy - h_ / 2;
+    double nub_w = 2.5 * u;
+    uint32_t ocol = dark ? rgb(60, 60, 67) : rgb(235, 235, 240);
+    int OA = dark ? 210 : 220;
+    /* outline (AA rounded rect edge) */
+    paint_round((int)x0, (int)y0, (int)(x0 + w_), (int)(y0 + h_),
+                (int)fmax(2, 3 * u), ocol, OA, 1);
+    /* nub */
+    paint_round((int)(x0 + w_ + 1), (int)(cy - 2 * u),
+                (int)(x0 + w_ + nub_w), (int)(cy + 2 * u), 1, ocol, OA, 0);
+    /* fill level */
+    int pct = bat_pct;
+    bool charging = bat_charging || (pct < 0 && (ac_online || bat_full));
+    if (pct < 0)
+        pct = 100;                    /* no battery hw: on external power */
+    if (pct > 100)
+        pct = 100;
+    double iw = (w_ - 4 * u) * pct / 100.0;
+    if (iw >= 1) {
+        uint32_t fcol = dark ? rgb(45, 45, 50) : rgb(240, 240, 245);
+        if (pct <= 20 && !charging)
+            fcol = rgb(255, 59, 48);
+        paint_round((int)(x0 + 2 * u), (int)(y0 + 2 * u),
+                    (int)(x0 + 2 * u + iw), (int)(y0 + h_ - 2 * u),
+                    1, fcol, 235, 0);
+    }
+    /* charging bolt (small yellow lightning, macOS-style) */
+    if (charging) {
+        double cx = x0 + w_ / 2;
+        double cy0 = y0 + 1.2 * u, cy1 = y0 + h_ - 1.2 * u;
+        double s = h_ * 0.62;
+        paint_tri(cx + 0.5 * s, cy0, cx - 0.55 * s, cy0 + 0.62 * s,
+                  cx + 0.12 * s, cy0 + 0.62 * s, rgb(255, 204, 0), 235);
+        paint_tri(cx - 0.5 * s, cy1, cx + 0.55 * s, cy1 - 0.62 * s,
+                  cx - 0.12 * s, cy1 - 0.62 * s, rgb(255, 204, 0), 235);
+    }
 }
 
 static void draw_fps(int dark)
@@ -1012,11 +1284,29 @@ static void draw_fps(int dark)
     if (!fps_ready)
         return;                               /* no completed window yet */
     snprintf(buf, sizeof(buf), "%d FPS", fps_now);
-    int x = W - 12 - ui_text_w("23:59", 0) - 14 - ui_text_w(buf, 0);
+    int x = W - 12 - ui_text_w("23:59", 0) - 10 - ui_text_w("Sep 30", 0) -
+            12 - bat_icon_w() - 12 - ui_text_w(buf, 0);
     int y = (panel_h - UIF_CELLH) / 2;
     if (y < 2)
         y = 2;
     ui_text(x, y, buf, dark ? rgb(60, 60, 67) : rgb(168, 170, 176), 0);
+}
+
+static void draw_status_right(int dark)
+{
+    int y = (panel_h - UIF_CELLH) / 2;
+    if (y < 2)
+        y = 2;
+    if (clk_valid) {
+        /* time, rightmost (macOS) */
+        int xt = W - 12 - ui_text_w(clk_str, 0);
+        ui_text(xt, y, clk_str, dark ? rgb(35, 35, 40) : rgb(240, 240, 245), 0);
+        /* date left of the time */
+        int xd = xt - 10 - ui_text_w(dat_str, 0);
+        ui_text(xd, y, dat_str, dark ? rgb(60, 60, 67) : rgb(220, 220, 226), 0);
+        /* battery icon left of the date */
+        draw_battery(xd - 12, panel_h / 2, dark);
+    }
 }
 
 static void draw_clock(int dark)
@@ -1031,31 +1321,64 @@ static void draw_clock(int dark)
 }
 
 /* ---------------- menu bar --------------------------------------------- */
+/* title rects (horizontal layout: droplet, Settings, File, Window) */
 static void menu_geometry(void)
 {
-    int drop_s = (int)fmax(13.0, 15.0 * u);
+    int drop_s = (int)fmax(13.0, 14.0 * u);
     dr_x0 = MENU_X;
     dr_y0 = (panel_h - drop_s) / 2;
     dr_x1 = dr_x0 + drop_s - 1;
     dr_y1 = dr_y0 + drop_s - 1;
-    set_x = dr_x1 + 1 + (int)(11 * u);
-    int tww = ui_text_w("Settings", 1);
-    ti_x0 = set_x - (int)(8 * u);
-    ti_y0 = (int)(3 * u);
-    ti_x1 = set_x + tww + 4 + 9 + (int)(7 * u);   /* text + gap + chevron */
-    ti_y1 = panel_h - 1 - (int)(3 * u);
-    /* the dropdown hangs below the item it belongs to (macOS) */
-    dd_x0 = ti_x0;
-    dd_y0 = panel_h + (int)(3 * u);
-    int mw = ui_text_w("About AquaOS", 0) + (int)(40 * u);
-    if (mw < (int)(150 * u))
-        mw = (int)(150 * u);
-    dd_x1 = dd_x0 + mw;
-    it_x0 = dd_x0 + (int)(5 * u);
-    it_y0 = dd_y0 + (int)(5 * u);
-    it_x1 = dd_x1 - (int)(5 * u);
-    it_y1 = it_y0 + (int)(26 * u);
+    int x = dr_x1 + 1 + (int)(11 * u);
+    for (int m = 0; m < NMENUS; m++) {
+        int tww = ui_text_w(mtitle[m], mtitle_bold[m] ? 1 : 0);
+        tr[m][0] = x - (int)(8 * u);
+        tr[m][1] = (int)(2 * u);
+        tr[m][2] = x + tww + (int)(8 * u);
+        tr[m][3] = panel_h - 1 - (int)(2 * u);
+        x = tr[m][2] + (int)(6 * u);
+    }
+}
+
+/* dropdown geometry for a given menu (rects for items included) */
+static void menu_geometry_for(int m)
+{
+    int n = 0, w = 0;
+    for (int i = 0; i < MITEMS_MAX && mitems[m][i]; i++) {
+        int iw = ui_text_w(mitems[m][i], 0);
+        if (iw > w)
+            w = iw;
+        n++;
+    }
+    w += (int)(44 * u);
+    if (w < (int)(150 * u))
+        w = (int)(150 * u);
+    dd_x0 = tr[m][0];
+    if (w > W - dd_x0 - 8)
+        w = W - dd_x0 - 8;
+    dd_y0 = panel_h + (int)(2 * u);
+    dd_x1 = dd_x0 + w - 1;
+    int iy = dd_y0 + (int)(5 * u);
+    for (int i = 0; i < n; i++) {
+        it_r[i][0] = dd_x0 + (int)(5 * u);
+        it_r[i][1] = iy;
+        it_r[i][2] = dd_x1 - (int)(5 * u);
+        it_r[i][3] = iy + (int)(26 * u) - 1;
+        iy += (int)(26 * u);
+    }
+    it_x0 = it_r[0][0];
+    it_x1 = it_r[0][2];
+    it_y0 = it_r[0][1];
+    it_y1 = it_r[n - 1][3];
     dd_y1 = it_y1 + (int)(5 * u);
+}
+
+static int menu_item_count(int m)
+{
+    int n = 0;
+    for (int i = 0; i < MITEMS_MAX && mitems[m][i]; i++)
+        n++;
+    return n;
 }
 
 /* draw an arbitrary RGBA icon (premultiplied-less, straight alpha) */
@@ -1066,43 +1389,10 @@ static void draw_icon_rgba(const unsigned char *data, int iw, int ih,
 static void tex_blit_alpha(const uint32_t *tex, int tx, int ty, int tw_,
                            int th_, int galpha);
 
-/* small anti-aliased chevron pointing down (~9x6 px) */
-static void draw_chevron(int x, int y, uint32_t col)
-{
-    const int SS = 3;
-    double th = 0.95;                          /* half stroke width      */
-    for (int py = 0; py < 7; py++) {
-        int yy = y + py;
-        if (yy < cy0 || yy > cy1)
-            continue;
-        for (int px = 0; px < 10; px++) {
-            int xx = x + px;
-            if (xx < cx0 || xx > cx1)
-                continue;
-            int cov = 0;
-            for (int sy = 0; sy < SS; sy++)
-                for (int sx = 0; sx < SS; sx++) {
-                    double fx = px + (sx + 0.5) / SS;
-                    double fy = py + (sy + 0.5) / SS;
-                    double d1 = seg_dist(fx, fy, 0.4, 0.6, 4.5, 5.2);
-                    double d2 = seg_dist(fx, fy, 4.5, 5.2, 8.6, 0.6);
-                    if (fmin(d1, d2) <= th)
-                        cov++;
-                }
-            if (!cov)
-                continue;
-            int a = cov * 255 / (SS * SS);
-            uint32_t ob = back[(size_t)yy * W + xx];
-            unsigned rr = ((ob >> 16 & 255) * (255 - a) + (col >> 16 & 255) * a) / 255;
-            unsigned gg = ((ob >>  8 & 255) * (255 - a) + (col >>  8 & 255) * a) / 255;
-            unsigned bb = ((ob       & 255) * (255 - a) + (col       & 255) * a) / 255;
-            back[(size_t)yy * W + xx] = rgb(rr, gg, bb);
-        }
-    }
-}
-
 /* ---- frosted macOS panels (dropdown / About), baked with soft shadow ----
- * texel format: ARGB, alpha in the top byte; shadow texels are pure alpha */
+ * texel format: ARGB, alpha in the top byte; shadow texels are pure alpha.
+ * The shadow hugs the rounded silhouette, is biased downwards like macOS
+ * and fades out smoothly - no rectangular halo. */
 static void bake_panel_tex(uint32_t *tex, int *ptw, int *pth,
                            int px0, int py0, int px1, int py1,
                            int M, double rad, double sigma, double amax)
@@ -1112,6 +1402,7 @@ static void bake_panel_tex(uint32_t *tex, int *ptw, int *pth,
     *ptw = tw_;
     *pth = th_;
     memset(tex, 0, (size_t)tw_ * th_ * 4);
+    double offy = 3.0 * u;
 
     /* blurred backdrop for the frosted look */
     int bx0 = px0 - M < 0 ? 0 : px0 - M;
@@ -1128,8 +1419,8 @@ static void bake_panel_tex(uint32_t *tex, int *ptw, int *pth,
             for (int y = 0; y < bh; y++)
                 memcpy(s1 + (size_t)y * bw,
                        desktop + (size_t)(by0 + y) * W + bx0, (size_t)bw * 4);
-            box_blur_h(s2, s1, bw, bh, 4);
-            box_blur_v(s1, s2, bw, bh, 2);
+            box_blur_h(s2, s1, bw, bh, 6);
+            box_blur_v(s1, s2, bw, bh, 3);
             have_blur = true;
         }
     }
@@ -1137,13 +1428,13 @@ static void bake_panel_tex(uint32_t *tex, int *ptw, int *pth,
     for (int y = 0; y < th_; y++) {
         uint32_t *d = tex + (size_t)y * tw_;
         for (int x = 0; x < tw_; x++) {
-            double dS = sd_round(x + 0.5, y + 0.5, M, M, M + pw - 1,
+            double dS = sd_round(x + 0.5, y + 0.5 - offy, M, M, M + pw - 1,
                                  M + ph - 1, rad);
             if (dS <= 0.5) {                  /* panel body (AA edge) */
                 double cov = 0.5 - dS;
                 if (cov > 1)
                     cov = 1;
-                unsigned r = 246, g = 246, b = 248;
+                unsigned r = 250, g = 250, b = 252;
                 if (have_blur) {
                     int sx = px0 - M + x - bx0;
                     int sy = py0 - M + y - by0;
@@ -1152,23 +1443,30 @@ static void bake_panel_tex(uint32_t *tex, int *ptw, int *pth,
                     if (sx >= bw) sx = bw - 1;
                     if (sy >= bh) sy = bh - 1;
                     uint32_t v = s1[(size_t)sy * bw + sx];
-                    r = (unsigned)(((v >> 16 & 255) * 56 + 246 * 200) >> 8);
-                    g = (unsigned)(((v >>  8 & 255) * 56 + 246 * 200) >> 8);
-                    b = (unsigned)(((v       & 255) * 59 + 248 * 197) >> 8);
+                    r = (unsigned)(((v >> 16 & 255) * 33 + 250 * 223) >> 8);
+                    g = (unsigned)(((v >>  8 & 255) * 33 + 250 * 223) >> 8);
+                    b = (unsigned)(((v       & 255) * 36 + 252 * 220) >> 8);
                 }
                 double bcov = 0.5 - fabs(dS); /* hairline border */
                 if (bcov > 0) {
                     if (bcov > 1)
                         bcov = 1;
-                    int BA = (int)(bcov * 44 + 0.5);
+                    int BA = (int)(bcov * 26 + 0.5);
                     r = (unsigned)((r * (255 - BA)) / 255);
                     g = (unsigned)((g * (255 - BA)) / 255);
                     b = (unsigned)((b * (255 - BA)) / 255);
                 }
                 int A = (int)(cov * 255.0 + 0.5);
                 d[x] = ((uint32_t)A << 24) | (r << 16) | (g << 8) | b;
-            } else if (dS <= M) {             /* soft neutral shadow */
+            } else if (dS <= sigma * 2.4 && dS <= M) {   /* soft shadow */
                 double a = amax * exp(-(dS - 0.5) / sigma);
+                double dm = (double)M - dS;   /* fade at margin */
+                if (dm < 2.5) {
+                    if (dm <= 0)
+                        a = 0;
+                    else
+                        a *= dm / 2.5;
+                }
                 int A = (int)(a + 0.5);
                 if (A > 255)
                     A = 255;
@@ -1183,26 +1481,30 @@ static void bake_panel_tex(uint32_t *tex, int *ptw, int *pth,
 
 static void render_menu_tex(void)
 {
-    if (!menu_tex || !desktop)
+    if (!menu_tex || !desktop || menu_idx < 0)
+        return;
+    if (menu_tex_alloc_w < 10 || menu_tex_alloc_h < 10)
         return;
     bake_panel_tex(menu_tex, &menu_tex_w, &menu_tex_h,
-                   dd_x0, dd_y0, dd_x1, dd_y1, DDMc, 8.0 * u, 8.0 * u, 70.0);
+                   dd_x0, dd_y0, dd_x1, dd_y1, DDMc, 10.0 * u, 13.0 * u, 42.0);
 }
 
 static void render_about_tex(void)
 {
     if (!about_tex || !desktop)
         return;
-    char ln_kernel[80], ln_fb[80], ln_up[80], ln_fps[80];
+    char ln_kernel[80], ln_fb[80], ln_up[80], ln_fps[80], ln_tz[80];
     int n = 0;
-    const char *lines[6];
-    lines[n++] = "Version 1.6 (AquaOS desktop)";
+    const char *lines[8];
+    lines[n++] = "Version 1.7 (AquaOS desktop)";
     if (kver[0]) {
         snprintf(ln_kernel, sizeof(ln_kernel), "Kernel %s", kver);
         lines[n++] = ln_kernel;
     }
     snprintf(ln_fb, sizeof(ln_fb), "Framebuffer %dx%d @ %d bpp", W, H, BPP * 8);
     lines[n++] = ln_fb;
+    snprintf(ln_tz, sizeof(ln_tz), "Time zone MSK (UTC+3)");
+    lines[n++] = ln_tz;
     double up = now();
     snprintf(ln_up, sizeof(ln_up), "Uptime %d:%02d:%02d",
              (int)up / 3600, ((int)up / 60) % 60, (int)up % 60);
@@ -1220,16 +1522,16 @@ static void render_about_tex(void)
     int pw = wmax + (int)(44 * u);
     int ph = (int)(16 * u) + UIF_CELLH + (int)(7 * u) +
              n * (UIF_CELLH + (int)(5 * u)) + (int)(15 * u);
-    if (pw > (int)(330 * u))
-        pw = (int)(330 * u);
-    if (ph > (int)(188 * u))
-        ph = (int)(188 * u);
+    if (pw > (int)(340 * u))
+        pw = (int)(340 * u);
+    if (ph > (int)(230 * u))
+        ph = (int)(230 * u);
     ab_x0 = (W - pw) / 2;
     ab_x1 = ab_x0 + pw - 1;
     ab_y0 = (H - ph) * 2 / 5;
     ab_y1 = ab_y0 + ph - 1;
     bake_panel_tex(about_tex, &about_tex_w, &about_tex_h,
-                   ab_x0, ab_y0, ab_x1, ab_y1, AMDc, 10.0 * u, 8.0 * u, 80.0);
+                   ab_x0, ab_y0, ab_x1, ab_y1, AMDc, 12.0 * u, 13.0 * u, 46.0);
     int tx = AMDc + (int)(22 * u);
     int ty = AMDc + (int)(16 * u);
     ui_text_tex(about_tex, about_tex_w, about_tex_h, tx, ty, "AquaOS",
@@ -1250,45 +1552,68 @@ static void draw_about(void)
                    about_tex_w, about_tex_h, 256);
 }
 
+/* menu item availability (macOS grays out unavailable items) */
+static bool item_enabled(int m, int i)
+{
+    if (m == 0)
+        return true;                          /* About AquaOS */
+    if (m == 1)
+        return i == 0 ? true                   /* New Window: open/restore */
+                      : (tm == TM_OPEN && !tm_anim);
+    /* Window menu */
+    return tm == TM_OPEN && !tm_anim && !dragging;
+}
+
 static void draw_menu_animated(void)
 {
-    /* droplet logo at the left (clickable, never highlighted) */
+    /* droplet logo at the left (clickable, like the app menu) */
     draw_icon_rgba(DROP_ICON_DATA, DROP_ICON_W, DROP_ICON_H,
                    dr_x0, dr_y0, dr_x1 - dr_x0 + 1);
-    bool hov = in_rect(mx, my, ti_x0, ti_y0, ti_x1, ti_y1);
-    if (menu_open)
-        paint_round(ti_x0, ti_y0, ti_x1, ti_y1, 5, rgb(10, 122, 255), 256, 0);
-    else if (hov)
-        paint_round(ti_x0, ti_y0, ti_x1, ti_y1, 5, rgb(0, 0, 0), 30, 0);
-    int ty = (panel_h - UIF_CELLH) / 2;
-    if (ty < 2)
-        ty = 2;
-    ui_text(set_x, ty, "Settings",
-            menu_open ? rgb(255, 255, 255) : rgb(28, 28, 30), 1);
-    draw_chevron(set_x + ui_text_w("Settings", 1) + 4, (panel_h - 7) / 2,
-                 menu_open ? rgb(255, 255, 255) : rgb(70, 70, 75));
-    if (menu_a <= 0.003)
+    /* menu titles: blue when their dropdown is open, soft gray on hover */
+    for (int m = 0; m < NMENUS; m++) {
+        bool hov = in_rect(mx, my, tr[m][0], tr[m][1], tr[m][2], tr[m][3]);
+        if (menu_open && m == menu_idx)
+            paint_round(tr[m][0], tr[m][1], tr[m][2], tr[m][3], 5,
+                        rgb(10, 122, 255), 256, 0);
+        else if (hov)
+            paint_round(tr[m][0], tr[m][1], tr[m][2], tr[m][3], 5,
+                        rgb(0, 0, 0), 30, 0);
+        int ty = (panel_h - UIF_CELLH) / 2;
+        if (ty < 2)
+            ty = 2;
+        ui_text(tr[m][0] + (int)(8 * u), ty, mtitle[m],
+                (menu_open && m == menu_idx) ? rgb(255, 255, 255)
+                                             : rgb(28, 28, 30),
+                mtitle_bold[m] ? 1 : 0);
+    }
+    if (menu_a <= 0.003 || menu_idx < 0)
         return;
 
     /* eased open state: slide + fade, texture includes the soft shadow */
     double e = menu_a;
     e = e * e * (3 - 2 * e);                  /* smoothstep */
-    int oy = (int)((1.0 - e) * -10 * u);
+    int oy = (int)((1.0 - e) * -8 * u);
     int alpha = (int)(e * 256);
     if (alpha > 256)
         alpha = 256;
     tex_blit_alpha(menu_tex, dd_x0 - DDMc, dd_y0 - DDMc + oy,
                    menu_tex_w, menu_tex_h, alpha);
-    int iy0 = it_y0 + oy, iy1 = it_y1 + oy;
-    bool ah = in_rect(mx, my, it_x0, iy0, it_x1, iy1);
-    if (ah && alpha > 60)
-        paint_round(it_x0, iy0, it_x1, iy1, 5, rgb(10, 122, 255), alpha, 0);
-    /* text only while visibly open: ui_text has no per-call alpha, so
-     * drawing it during the fade-out tail would leave a ghost behind */
     if (alpha > 150) {
-        int lty = iy0 + ((iy1 - iy0) - UIF_CELLH) / 2;
-        ui_text(it_x0 + (int)(10 * u), lty, "About AquaOS",
-                ah ? rgb(255, 255, 255) : rgb(28, 28, 30), 0);
+        int n = menu_item_count(menu_idx);
+        for (int i = 0; i < n; i++) {
+            bool en = item_enabled(menu_idx, i);
+            bool ah = en && in_rect(mx, my, it_r[i][0], it_r[i][1] + oy,
+                                    it_r[i][2], it_r[i][3] + oy);
+            if (ah && alpha > 60)
+                paint_round(it_r[i][0], it_r[i][1] + oy,
+                            it_r[i][2], it_r[i][3] + oy, 5,
+                            rgb(10, 122, 255), alpha, 0);
+            int lty = it_r[i][1] + oy + ((it_r[i][3] - it_r[i][1]) - UIF_CELLH) / 2;
+            uint32_t tcol = !en ? rgb(158, 158, 164)
+                                : (ah ? rgb(255, 255, 255) : rgb(28, 28, 30));
+            ui_text(it_r[i][0] + (int)(10 * u), lty, mitems[menu_idx][i],
+                    tcol, 0);
+        }
     }
 }
 
@@ -1375,16 +1700,23 @@ static void draw_dock_icon(void)
 
 static void dock_update(double dt)
 {
-    /* magnification: grows when the cursor is near the dock (macOS-like) */
-    bool near = in_desktop && my > ddy0 - (int)(ICON_BASE * u * 1.6) &&
-                mx > ddx0 - (int)(ICON_BASE * u) && mx < ddx1 + (int)(ICON_BASE * u);
-    double target = near ? 1.45 : 1.0;
-    double k = 1.0 - exp(-dt * 14.0);
+    /* macOS-style magnification: smooth distance-based falloff around the
+     * dock, not a binary near/far switch */
+    double target = 1.0;
+    if (in_desktop) {
+        int cx = (ddx0 + ddx1) / 2;
+        int cy = (ddy0 + ddy1) / 2;
+        if (my > ddy0 - (int)(ICON_BASE * u * 1.6)) {
+            double dx = mx - cx, dy = my - cy;
+            double sig = 150.0 * u;
+            double f = exp(-(dx * dx + dy * dy) / (2.0 * sig * sig));
+            target = 1.0 + 0.45 * f;
+        }
+    }
+    double k = 1.0 - exp(-dt * 16.0);
     icon_s += (target - icon_s) * k;
-    if (fabs(icon_s - 1.0) < 0.004 && target == 1.0)
+    if (fabs(icon_s - 1.0) < 0.003 && target == 1.0)
         icon_s = 1.0;
-    if (fabs(icon_s - 1.0) < 0.004 && target == 1.45)
-        icon_s = 1.45;
 }
 
 /* ---------------- terminal emulator ------------------------------------- */
@@ -1402,6 +1734,37 @@ static bool term_dirty = false;
 static pid_t sh_pid = -1;
 static int sh_fd = -1;
 static bool kbd_ready = false;
+
+/* ---- scrollback: history lines pushed when the grid scrolls ----
+ * sb_off = how many lines the view is above the live bottom (0 = live).
+ * Mouse wheel / PgUp / PgDn move the view; any keypress returns to live. */
+#define SB_MAX 600
+static uint8_t sb_ch[SB_MAX][TCOLS_MAX];
+static uint8_t sb_fg[SB_MAX][TCOLS_MAX];
+static uint8_t sb_bo[SB_MAX][TCOLS_MAX];
+static int sb_head = 0, sb_n = 0;
+static int sb_off = 0;
+static bool sb_dirty = false;             /* view moved, needs repaint   */
+
+static void sb_push_row(void)
+{
+    if (sb_n < SB_MAX) {
+        sb_n++;
+    } else {
+        sb_head = (sb_head + 1) % SB_MAX;
+    }
+    int idx = (sb_head + sb_n - 1) % SB_MAX;
+    memcpy(sb_ch[idx], tch, (size_t)t_cols);
+    memcpy(sb_fg[idx], tfg, (size_t)t_cols);
+    memcpy(sb_bo[idx], tbo, (size_t)t_cols);
+    if (sb_off > 0 && sb_off < SB_MAX)
+        sb_off++;                             /* keep the view anchored  */
+}
+
+static void sb_clear(void)
+{
+    sb_head = sb_n = sb_off = 0;
+}
 
 /* macOS Terminal "Pro"-like palette (8 basic + 8 bright) */
 static uint32_t PAL[16] = {
@@ -1448,6 +1811,7 @@ static void grid_clear_row(int r)
 
 static void grid_scroll(void)
 {
+    sb_push_row();
     memmove(tch, tch + t_cols, (size_t)(t_rows - 1) * t_cols);
     memmove(tfg, tfg + t_cols, (size_t)(t_rows - 1) * t_cols);
     memmove(tbo, tbo + t_cols, (size_t)(t_rows - 1) * t_cols);
@@ -1474,6 +1838,22 @@ static void term_reset(void)
     tfbold = false;
     ansi_st = 0;
     csi_n = 0;
+    sb_off = 0;
+}
+
+/* scroll the history view; clamps and flags a repaint */
+static void sb_scroll(int lines)
+{
+    int max_off = sb_n;
+    int v = sb_off + lines;
+    if (v > max_off)
+        v = max_off;
+    if (v < 0)
+        v = 0;
+    if (v != sb_off) {
+        sb_off = v;
+        sb_dirty = true;
+    }
 }
 
 static int csi_param(int idx, int defv)
@@ -1639,6 +2019,7 @@ static void term_feed(char c)
 static void term_spawn(void)
 {
     term_reset();
+    sb_clear();
     t_cols = (ww - (int)(16 * u)) / FONT_W;
     t_rows = (wh - tw_title - (int)(12 * u)) / FONT_H;
     if (t_cols > TCOLS_MAX) t_cols = TCOLS_MAX;
@@ -1681,6 +2062,7 @@ static void term_spawn(void)
         setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
         setenv("HOME", "/root", 1);
         setenv("PWD", "/", 1);
+        setenv("TZ", "MSK-3", 0);        /* Europe/Moscow, no DST */
         setenv("PS1", "aquaos:~$ ", 1);
         execl("/bin/sh", "sh", (char *)0);
         _exit(127);
@@ -1763,6 +2145,12 @@ static int map_key(uint16_t code, const uint8_t **out)
     if (code >= KEY_F1 && code <= KEY_F12) return 0;
 
     switch (code) {
+    case KEY_PAGEUP:
+        sb_scroll(t_rows - 2);                /* scrollback, like Linux vt */
+        return 0;
+    case KEY_PAGEDOWN:
+        sb_scroll(-(t_rows - 2));
+        return 0;
     case KEY_ENTER:    tmp[0] = '\r'; *out = tmp; return 1;
     case KEY_BACKSPACE:tmp[0] = 0x7f; *out = tmp; return 1;
     case KEY_TAB:      tmp[0] = '\t'; *out = tmp; return 1;
@@ -2006,28 +2394,15 @@ static void render_winbuf(int w, int h)
         }
     }
 
-    /* baked soft shadow in the margin ring around the window */
+    /* baked soft shadow: hugs the rounded silhouette (same radius as the
+     * corners), biased slightly downwards like macOS, fading out fully
+     * inside the margin - no rectangular frame around the roundings */
     {
-        double sig = 10.0 * u, amax = 58.0;
-        double rr = (WIN_R - 2) * u;
-        if (rr < 2)
-            rr = 2;
-        for (int y = 0; y < th_; y++) {
-            uint32_t *d = winbuf + (size_t)y * tw_;
-            for (int x = 0; x < tw_; x++) {
-                if (x >= ox && x < ox + w && y >= oy && y < oy + h)
-                    continue;                 /* window area is opaque */
-                double dd = sd_round(x + 0.5, y + 0.5, ox, oy,
-                                     ox + w - 1, oy + h - 1, rr);
-                if (dd < 0 || dd > SMc)
-                    continue;
-                int A = (int)(amax * exp(-dd / sig) + 0.5);
-                if (A < 2)
-                    continue;
-                if (A > 255) A = 255;
-                d[x] = (uint32_t)A << 24;     /* neutral black, alpha only */
-            }
-        }
+        int r = (int)(WIN_R * u);
+        if (r > w / 2) r = w / 2;
+        if (r > h / 2) r = h / 2;
+        bake_shadow_ring(winbuf, tw_, th_, ox, oy, w, h,
+                         (double)r, 15.0 * u, 50.0, 4.0 * u);
     }
 }
 
@@ -2099,7 +2474,9 @@ static void tex_blit_scaled_alpha(const uint32_t *tex, int tw_, int th_,
 }
 
 /* draw terminal grid + caret straight into `back` (the window texture
- * holds only chrome and backdrop, so typing never re-renders it) */
+ * holds only chrome and backdrop, so typing never re-renders it).
+ * The visible rows come from the scrollback when the view is scrolled up;
+ * a macOS-style scrollbar appears while the view is not at the bottom. */
 static void draw_term_content(int wx0, int wy0)
 {
     if (sh_fd < 0)
@@ -2108,16 +2485,40 @@ static void draw_term_content(int wx0, int wy0)
     int gy = wy0 + tw_title + (int)(4 * u);
     for (int r = 0; r < t_rows; r++) {
         int py0 = gy + r * FONT_H;
+        /* absolute line index of visible row r (sb_off lines above bottom) */
+        int L = sb_n - sb_off + r;
+        const uint8_t *ch_row, *fg_row, *bo_row;
+        uint8_t blank_fg[TCOLS_MAX];
+        if (L >= sb_n + t_rows || L < 0) {
+            memset(blank_fg, 255, (size_t)t_cols);
+            ch_row = NULL;
+            fg_row = blank_fg;
+            bo_row = NULL;
+        } else if (L < sb_n) {
+            int idx = (sb_head + L) % SB_MAX;
+            ch_row = sb_ch[idx];
+            fg_row = sb_fg[idx];
+            bo_row = sb_bo[idx];
+        } else {
+            int gr = L - sb_n;
+            ch_row = tch + (size_t)gr * t_cols;
+            fg_row = tfg + (size_t)gr * t_cols;
+            bo_row = tbo + (size_t)gr * t_cols;
+        }
+        if (!ch_row)
+            continue;
         for (int c = 0; c < t_cols; c++) {
-            int i = r * t_cols + c;
-            uint8_t ch = tch[i];
+            uint8_t ch = ch_row[c];
             if (!ch)
                 continue;
             if (ch < FONT_FIRST || ch > FONT_FIRST + FONT_COUNT - 1)
                 ch = '?';
             const unsigned char (*gl)[FONT_W] =
                 (const unsigned char (*)[FONT_W])FONT_BITMAP[ch - FONT_FIRST];
-            uint32_t col = cell_color(i);
+            int fi = fg_row[c];
+            uint32_t col = fi == 255 ? TERM_FG_DEFAULT
+                           : (bo_row && bo_row[c] && fi < 8 ? PAL[fi + 8]
+                                                            : PAL[fi]);
             int px0 = gx + c * FONT_W;
             for (int ry = 0; ry < FONT_H; ry++) {
                 int py = py0 + ry;
@@ -2141,8 +2542,8 @@ static void draw_term_content(int wx0, int wy0)
             }
         }
     }
-    /* caret: thin light bar at the cursor cell (macOS-style) */
-    if (caret_on) {
+    /* caret: thin light bar at the cursor cell (only in the live view) */
+    if (caret_on && sb_off == 0) {
         int px0 = gx + tcx * FONT_W;
         int py0 = gy + tcy * FONT_H;
         int cw = FONT_W >= 8 ? 2 : 1;
@@ -2156,6 +2557,32 @@ static void draw_term_content(int wx0, int wy0)
                 if (px < cx0 || px > cx1)
                     continue;
                 d[px] = rgb(235, 235, 238);
+            }
+        }
+    }
+    /* macOS-style slim scrollbar, only while the view is scrolled up */
+    if (sb_off > 0 && sb_n > 0) {
+        int total = sb_n + t_rows;
+        int area_h = t_rows * FONT_H;
+        int tx0 = wx0 + ww - (int)(7 * u);
+        int th_h = (int)((double)area_h * t_rows / total);
+        if (th_h < (int)(18 * u))
+            th_h = (int)(18 * u);
+        int ty0 = gy + (int)((double)area_h * (sb_n - sb_off) / total);
+        if (ty0 + th_h > gy + area_h)
+            ty0 = gy + area_h - th_h;
+        for (int y = ty0; y < ty0 + th_h; y++) {
+            if (y < cy0 || y > cy1)
+                continue;
+            uint32_t *d = back + (size_t)y * W;
+            for (int x = tx0; x < tx0 + (int)(4 * u); x++) {
+                if (x < cx0 || x > cx1)
+                    continue;
+                uint32_t ob = d[x];
+                unsigned rr = ((ob >> 16 & 255) * 97 + 255 * 158) >> 8;
+                unsigned gg = ((ob >>  8 & 255) * 97 + 255 * 158) >> 8;
+                unsigned bb = ((ob       & 255) * 97 + 255 * 158) >> 8;
+                d[x] = rgb(rr, gg, bb);
             }
         }
     }
@@ -2193,7 +2620,7 @@ static bool win_cur_rect(int *x0, int *y0, int *x1, int *y1, int *alpha)
         double t = (now() - tm_t0) / ANIM_MS;
         if (t < 0) t = 0;
         if (t > 1) t = 1;
-        double e = 1 - (1 - t) * (1 - t) * (1 - t);   /* ease-out cubic */
+        double e = 1 - (1 - t) * (1 - t) * (1 - t) * (1 - t) * (1 - t);
         *x0 = A_fx0 + (int)((A_tx0 - A_fx0) * e);
         *y0 = A_fy0 + (int)((A_ty0 - A_fy0) * e);
         *x1 = A_fx1 + (int)((A_tx1 - A_fx1) * e);
@@ -2335,7 +2762,9 @@ static void win_zoom(void)
 
 /* ---------------- window drawing ----------------------------------------- */
 /* the texture already carries the shadow and the rounded corners as
- * per-texel alpha, so every dirty-rect repaint restores both correctly */
+ * per-texel alpha, so every dirty-rect repaint restores both correctly.
+ * While dragging, an extra "lift" shadow is drawn under the window - the
+ * macOS picking-up feel. */
 static void draw_window(void)
 {
     int x0, y0, x1, y1, alpha;
@@ -2344,6 +2773,10 @@ static void draw_window(void)
     if (!tm_anim && alpha >= 256 &&
         winbuf_w == (x1 - x0 + 1) + 2 * SMc &&
         winbuf_h == (y1 - y0 + 1) + 2 * SMc) {
+        if (dragging && lift_tex &&
+            lift_tex_w == winbuf_w && lift_tex_h == winbuf_h)
+            tex_blit_alpha(lift_tex, x0 - SMc, y0 - SMc,
+                           lift_tex_w, lift_tex_h, 256);
         tex_blit_alpha(winbuf, x0 - SMc, y0 - SMc, winbuf_w, winbuf_h, 256);
         draw_term_content(x0, y0);
         return;
@@ -2365,7 +2798,18 @@ static int acc(int d)
 }
 
 /* /dev/input/mice (mousedev): dy uses the device convention (+ = away from
- * the user = screen UP), so screen-space Y needs the negation */
+ * the user = screen UP), so screen-space Y needs the negation.
+ * The mousedev char format is FIXED 3-byte packets [flags, dx, dy];
+ * the wheel arrives separately via evdev REL_WHEEL (wheel_fd). */
+/* mousedev byte0 layout: 0x08 (always set) | 0x10 (dx<0) | 0x20 (dy<0)
+ * | buttons 0x07.  The sign bits are a NORMAL part of every packet, so
+ * only bits 0xC0 mark an impossible byte.  (The old 0xF0 mask rejected
+ * every packet with a negative delta, desyncing the whole stream.) */
+static bool pkt_start(uint8_t b)
+{
+    return (b & 0x08) && !(b & 0xC0);
+}
+
 static void pump_mouse(void)
 {
     if (mouse_fd < 0) {
@@ -2383,27 +2827,32 @@ static void pump_mouse(void)
         ssize_t n = read(mouse_fd, b, sizeof(b));
         if (n < 3)
             break;
-        for (ssize_t i = 0; i + 3 <= n; i += 3) {
+        ssize_t i = 0;
+        /* kernel mousedev (/dev/input/mice) emits FIXED 3-byte packets:
+         * [0x08|signs|buttons, dx, dy].  There is no 4-byte wheel variant
+         * here (wheel arrives via evdev REL_WHEEL on wheel_fd).  The old
+         * "guess 4-byte" heuristic swallowed the next packet's flag byte
+         * whenever dx was 0..7, which ate mouse clicks entirely. */
+        while (i + 3 <= n) {
+            if (!pkt_start(b[i])) {
+                i++;                           /* resync on garbage */
+                continue;
+            }
             int f = b[i];
             int dx = b[i + 1], dy = b[i + 2];
             if (f & 0x10)
                 dx -= 256;
             if (f & 0x20)
                 dy -= 256;
+            i += 3;
+
             mx += acc(dx);
-            my -= acc(dy);                        /* device Y is inverted */
+            my -= acc(dy);                    /* device Y is inverted */
             if (mx < 0) mx = 0;
             if (my < 0) my = 0;
             if (mx > W - 1) mx = W - 1;
             if (my > H - 1) my = H - 1;
-            {
-                static double last_pos_log = 0;
-                double tn = now();
-                if ((dx || dy) && tn - last_pos_log >= 1.0) {
-                    last_pos_log = tn;
-                    fprintf(stderr, "POS %d %d\n", mx, my);
-                }
-            }
+
             int l = f & 0x01;
             if (l && !btn_l) {
                 double tnow = now();
@@ -2420,6 +2869,63 @@ static void pump_mouse(void)
     }
 }
 
+/* ---- mouse wheel via evdev (unambiguous REL_WHEEL events) ---- */
+static void wheel_scan(void)
+{
+    if (wheel_fd >= 0)
+        return;
+    double t = now();
+    if (t - wheel_try < 0.5)
+        return;
+    wheel_try = t;
+    for (int i = 0; i < 8; i++) {
+        char p[32];
+        snprintf(p, sizeof(p), "/dev/input/event%d", i);
+        int fd = open(p, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        uint8_t bits[(EV_CNT + 7) / 8];
+        memset(bits, 0, sizeof(bits));
+        if (ioctl(fd, EVIOCGBIT(0, sizeof(bits)), bits) >= 0 &&
+            (bits[EV_REL >> 3] & (1 << (EV_REL & 7)))) {
+            uint8_t relbits[(REL_CNT + 7) / 8];
+            memset(relbits, 0, sizeof(relbits));
+            if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relbits)), relbits) >= 0 &&
+                (relbits[REL_WHEEL >> 3] & (1 << (REL_WHEEL & 7)))) {
+                wheel_fd = fd;
+                fprintf(stderr, "splash: wheel via %s\n", p);
+                return;
+            }
+        }
+        close(fd);
+    }
+}
+
+static void pump_wheel(void)
+{
+    if (wheel_fd < 0) {
+        wheel_scan();
+        return;
+    }
+    uint8_t buf[sizeof(struct input_event) * 16];
+    for (int k = 0; k < 8; k++) {
+        ssize_t n = read(wheel_fd, buf, sizeof(buf));
+        if (n < (ssize_t)sizeof(struct input_event))
+            break;
+        for (ssize_t off = 0; off + (ssize_t)sizeof(struct input_event) <= n;
+             off += sizeof(struct input_event)) {
+            struct input_event ev;
+            memcpy(&ev, buf + off, sizeof(ev));
+            if (ev.type == EV_REL && ev.code == REL_WHEEL && ev.value != 0 &&
+                tm == TM_OPEN && !tm_anim) {
+                sb_scroll(ev.value > 0 ? 3 : -3);   /* +1 = wheel up */
+            }
+        }
+        if (n < (ssize_t)sizeof(buf))
+            break;
+    }
+}
+
 /* ---------------- clicks --------------------------------------------------- */
 static void dock_activate(void)
 {
@@ -2431,6 +2937,46 @@ static void dock_activate(void)
         win_minimize();
     else if (tm == TM_MINIMIZED)
         win_restore();
+}
+
+/* menu item activation (all items do real work) */
+static void menu_activate(int m, int i);
+
+/* open the dropdown of a menu title */
+static void menu_open_at(int m)
+{
+    menu_idx = m;
+    menu_geometry_for(m);
+    render_menu_tex();
+    menu_open = true;
+    menu_closing = false;
+    menu_a = 0;
+}
+
+static void menu_activate(int m, int i)
+{
+    fprintf(stderr, "ACT menu %d,%d\n", m, i);
+    if (m == 0 && i == 0) {                   /* About AquaOS */
+        render_about_tex();
+        about_open = true;
+        about_dirty = true;
+        return;
+    }
+    if (m == 1 && i == 0) {                   /* New Window */
+        if (tm == TM_CLOSED)
+            win_open();
+        else if (tm == TM_MINIMIZED)
+            win_restore();
+    } else if (m == 1 && i == 1) {            /* Close Window */
+        if (tm == TM_OPEN)
+            win_close_start();
+    } else if (m == 2 && i == 0) {            /* Minimize */
+        if (tm == TM_OPEN)
+            win_minimize();
+    } else if (m == 2 && i == 1) {            /* Zoom */
+        if (tm == TM_OPEN)
+            win_zoom();
+    }
 }
 
 static bool click_in_buttons(int x, int y, int wx0, int wy0)
@@ -2456,15 +3002,31 @@ static void handle_click(int x, int y)
         return;
     }
 
-    /* menu takes priority while open; any click closes it (macOS behaviour) */
+    /* menu takes priority while open (macOS behaviour) */
     if (menu_open) {
         double e = menu_a * menu_a * (3 - 2 * menu_a);
-        int oy = (int)((1.0 - e) * -10 * u);
-        if (in_rect(x, y, it_x0, it_y0 + oy, it_x1, it_y1 + oy)) {
-            fprintf(stderr, "ACT about\n");
-            render_about_tex();
-            about_open = true;
-            about_dirty = true;
+        int oy = (int)((1.0 - e) * -8 * u);
+        int n = menu_item_count(menu_idx);
+        for (int i = 0; i < n; i++) {
+            if (in_rect(x, y, it_r[i][0], it_r[i][1] + oy,
+                        it_r[i][2], it_r[i][3] + oy)) {
+                if (item_enabled(menu_idx, i)) {
+                    menu_open = false;
+                    menu_closing = true;
+                    menu_activate(menu_idx, i);
+                }
+                return;                       /* clicked an item row */
+            }
+        }
+        /* another title: switch to it (macOS hover-switching on click) */
+        for (int m = 0; m < NMENUS; m++) {
+            if (in_rect(x, y, tr[m][0], tr[m][1], tr[m][2], tr[m][3])) {
+                if (m != menu_idx) {
+                    menu_open_at(m);
+                    menu_a = 1.0;             /* swap without re-animating */
+                }
+                return;
+            }
         }
         menu_open = false;
         menu_closing = true;
@@ -2481,7 +3043,7 @@ static void handle_click(int x, int y)
         return;
     }
 
-    /* window traffic lights (stable, visible window only) */
+    /* window: traffic lights, title-bar drag, double-click zoom */
     if (tm == TM_OPEN && !tm_anim) {
         int a, b, c, d, al;
         win_cur_rect(&a, &b, &c, &d, &al);
@@ -2499,19 +3061,40 @@ static void handle_click(int x, int y)
                     win_minimize();
                 else if (dist2 <= lr)
                     win_zoom();
+            } else if (y < b + tw_title) {
+                if (tm_zoomed) {
+                    win_zoom();               /* dragging a zoomed window
+                                                 un-zooms it (macOS) */
+                } else {
+                    double tnow = now();
+                    if (last_title_clk > 0 && tnow - last_title_clk < 0.35) {
+                        last_title_clk = -1;
+                        win_zoom();           /* double-click: zoom */
+                    } else {
+                        dragging = true;      /* start macOS-style drag */
+                        drag_gx = x - a;
+                        drag_gy = y - b;
+                        last_title_clk = tnow;
+                        fprintf(stderr, "ACT drag start\n");
+                    }
+                }
             }
             return;                            /* clicks inside are consumed */
         }
     }
 
-    /* droplet logo or the Settings item open the menu */
-    if (in_rect(x, y, dr_x0 - 3, dr_y0 - 3, dr_x1 + 3, dr_y1 + 3) ||
-        in_rect(x, y, ti_x0, ti_y0, ti_x1, ti_y1)) {
-        fprintf(stderr, "HIT menu\n");
-        render_menu_tex();
-        menu_open = true;
-        menu_closing = false;
+    /* droplet or any menu title opens its dropdown */
+    if (in_rect(x, y, dr_x0 - 3, dr_y0 - 3, dr_x1 + 3, dr_y1 + 3)) {
+        fprintf(stderr, "HIT menu (app)\n");
+        menu_open_at(0);
         return;
+    }
+    for (int m = 0; m < NMENUS; m++) {
+        if (in_rect(x, y, tr[m][0], tr[m][1], tr[m][2], tr[m][3])) {
+            fprintf(stderr, "HIT menu (%s)\n", mtitle[m]);
+            menu_open_at(m);
+            return;
+        }
     }
     fprintf(stderr, "MISS (%d,%d)\n", x, y);
 }
@@ -2553,7 +3136,7 @@ static void scene_render(int x0, int y0, int x1, int y1)
     draw_menu_animated();
     draw_about();
     draw_fps(1);
-    draw_clock(1);
+    draw_status_right(1);
     draw_cursor();
     blit_rect(cx0, cy0, cx1, cy1);
 }
@@ -2609,6 +3192,11 @@ int main(void)
     signal(SIGHUP, SIG_IGN);
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    /* Europe/Moscow time (MSK, UTC+3, no DST). init normally exports TZ
+     * before starting us; keep a fallback for direct launches. */
+    setenv("TZ", "MSK-3", 0);
+    tzset();
+
     /* keep the kernel VT out of the picture: graphics mode stops fbcon from
      * drawing console text / cursor over our framebuffer (like X.org does);
      * diagnostics go to the serial port instead of the screen */
@@ -2634,6 +3222,8 @@ int main(void)
     build_desktop();
     cursor_init();
     menu_geometry();
+    battery_poll();
+    bat_next = 2.0;
     icon_s_drawn = 1.0;
 
     double t0 = now(), last = t0, rot = 0, fade0 = 0;
@@ -2727,15 +3317,58 @@ int main(void)
             in_desktop = true;
             pmx = mx; pmy = my;
             pump_mouse();
+            pump_wheel();
             pump_keyboard();
-            if (keyq_n > 0 && sh_fd >= 0) {
-                term_write(keyq, keyq_n);
-                keyq_n = 0;
-            } else if (keyq_n > 0) {
+            if (keyq_n > 0) {
+                if (sh_fd >= 0) {
+                    sb_scroll(-SB_MAX);       /* typing returns to live */
+                    term_write(keyq, keyq_n);
+                }
                 keyq_n = 0;
             }
+
+            /* macOS-style window drag: 1:1 follow, clamped to the screen */
+            if (dragging) {
+                if (!btn_l || tm != TM_OPEN || tm_anim) {
+                    dragging = false;
+                    fprintf(stderr, "ACT drag end\n");
+                } else {
+                    int nx = mx - drag_gx, ny = my - drag_gy;
+                    if (nx < -ww + (int)(80 * u)) nx = -ww + (int)(80 * u);
+                    if (nx > W - (int)(80 * u)) nx = W - (int)(80 * u);
+                    if (ny < panel_h) ny = panel_h;
+                    if (ny > H - tw_title - (int)(6 * u))
+                        ny = H - tw_title - (int)(6 * u);
+                    if (nx != wx || ny != wy) {
+                        wx = nx; wy = ny;
+                    }
+                }
+            }
+
+            /* macOS hover-switching: an open menu follows the pointer to
+             * other titles without a click */
+            if (menu_open && menu_a >= 0.999 && !about_open) {
+                for (int m = 0; m < NMENUS; m++) {
+                    if (m != menu_idx &&
+                        in_rect(mx, my, tr[m][0], tr[m][1], tr[m][2], tr[m][3])) {
+                        extra_rect[0] = dd_x0 - DDMc - 2;
+                        extra_rect[1] = dd_y0 - DDMc - 2;
+                        extra_rect[2] = dd_x1 + DDMc + 2;
+                        extra_rect[3] = dd_y1 + DDMc + 2;
+                        extra_dirty = true;
+                        menu_open_at(m);
+                        menu_a = 1.0;
+                        break;
+                    }
+                }
+            }
+
             dock_update(dt);
             clock_update();
+            if (t >= bat_next) {
+                battery_poll();
+                bat_next = t + 2.0;
+            }
 
             /* menu dropdown animation */
             if (menu_open) {
@@ -2746,12 +3379,21 @@ int main(void)
                 if (menu_a <= 0.0) { menu_a = 0.0; menu_closing = false; }
             }
 
-            /* caret blink */
-            if (tm == TM_OPEN && !tm_anim && sh_fd >= 0) {
+            /* caret blink: repaint only the caret cell, not the window */
+            if (tm == TM_OPEN && !tm_anim && sh_fd >= 0 && sb_off == 0) {
                 bool on = fmod(t, 1.06) < 0.53;
                 if (on != caret_on) {
                     caret_on = on;
-                    term_dirty = true;
+                    int a, b, c, d, al;
+                    if (win_cur_rect(&a, &b, &c, &d, &al)) {
+                        int gx = a + (int)(8 * u);
+                        int gy = b + tw_title + (int)(4 * u);
+                        carect[0] = gx + tcx * FONT_W - 1;
+                        carect[1] = gy + tcy * FONT_H - 1;
+                        carect[2] = carect[0] + FONT_W + 2;
+                        carect[3] = carect[1] + FONT_H + 2;
+                        caret_dirty = true;
+                    }
                 }
             }
             anim_update();
@@ -2768,36 +3410,45 @@ int main(void)
                     add_rect(force_x0 - m, force_y0 - m, force_x1 + m, force_y1 + m);
                     force_dirty = false;
                 }
-                /* cursor: cover old and new position; for teleports (fast
-                 * multi-packet moves) repaint the whole frame once — cheap
-                 * and guarantees no ghost trails */
-                if (abs(mx - pmx) > 50 || abs(my - pmy) > 50) {
-                    force_full = true;
-                } else {
+                if (extra_dirty) {
+                    add_rect(extra_rect[0], extra_rect[1],
+                             extra_rect[2], extra_rect[3]);
+                    extra_dirty = false;
+                }
+                /* cursor: union of the old and new positions. The scene
+                 * redraw inside any rect always recomposes every layer,
+                 * so a union is provably ghost-free - even for teleports
+                 * (no more full-screen repaints, no more mouse lag). */
+                {
                     int ax0 = pmx < mx ? pmx : mx;
                     int ay0 = pmy < my ? pmy : my;
                     int ax1 = pmx > mx ? pmx : mx;
                     int ay1 = pmy > my ? pmy : my;
-                    add_rect(ax0 - 4, ay0 - 4, ax1 + cur_w + 4, ay1 + cur_h + 4);
+                    add_rect(ax0 - 3, ay0 - 3, ax1 + cur_w + 3, ay1 + cur_h + 3);
                 }
 
                 int fx0, fy0, fx1, fy1;
                 fps_bbox(&fx0, &fy0, &fx1, &fy1);
                 add_rect(fx0, fy0, fx1, fy1);
 
-                /* menu */
-                bool hover = in_rect(mx, my, ti_x0, ti_y0, ti_x1, ti_y1);
+                /* menu bar: titles + dropdown */
+                bool hover_any = false;
+                for (int m = 0; m < NMENUS; m++)
+                    if (in_rect(mx, my, tr[m][0], tr[m][1], tr[m][2], tr[m][3]))
+                        hover_any = true;
                 static bool hover_prev = false;
-                if (menu_open || menu_a > 0.001 || menu_closing || hover != hover_prev) {
-                    add_rect(ti_x0 - 2, ti_y0, ti_x1 + 2, ti_y1);
-                    if (menu_a > 0.001) {
+                if (menu_open || menu_a > 0.001 || menu_closing ||
+                    hover_any != hover_prev) {
+                    for (int m = 0; m < NMENUS; m++)
+                        add_rect(tr[m][0] - 2, tr[m][1], tr[m][2] + 2, tr[m][3]);
+                    if (menu_a > 0.001 && menu_idx >= 0) {
                         double e = menu_a * menu_a * (3 - 2 * menu_a);
-                        int oy = (int)((1.0 - e) * -10 * u);
+                        int oy = (int)((1.0 - e) * -8 * u);
                         add_rect(dd_x0 - DDMc - 2, dd_y0 + oy - DDMc - 2,
                                  dd_x1 + DDMc + 2, dd_y1 + oy + DDMc + 2);
                     }
                 }
-                hover_prev = hover;
+                hover_prev = hover_any;
 
                 /* dock icon magnification / running dot */
                 bool dot_on = tm != TM_CLOSED;
@@ -2818,16 +3469,34 @@ int main(void)
                             int am = SMc + (int)(18 * u);
                             add_rect(A_fx0 - am, A_fy0 - am, A_fx1 + am, A_fy1 + am);
                             add_rect(A_tx0 - am, A_ty0 - am, A_tx1 + am, A_ty1 + am);
+                            prx0 = a; pry0 = b; prx1 = c; pry1 = d;
                         } else {
-                            static int px0 = -1, py0 = -1, px1 = -1, py1 = -1;
-                            if (term_dirty ||
-                                a != px0 || b != py0 || c != px1 || d != py1) {
+                            bool rect_changed =
+                                (a != prx0 || b != pry0 || c != prx1 || d != pry1);
+                            if (rect_changed && prx0 >= 0) {
+                                add_rect(prx0 - m, pry0 - m, prx1 + m, pry1 + m);
                                 add_rect(a - m, b - m, c + m, d + m);
-                                px0 = a; py0 = b; px1 = c; py1 = d;
+                            } else if (rect_changed) {
+                                add_rect(a - m, b - m, c + m, d + m);
+                            } else if (term_dirty) {
+                                add_rect(a - m, b - m, c + m, d + m);
+                            } else if (sb_dirty) {
+                                add_rect(a + 2, b + tw_title, c - 2, d);
                             }
+                            prx0 = a; pry0 = b; prx1 = c; pry1 = d;
                         }
                         term_dirty = false;
+                        sb_dirty = false;
                     }
+                } else {
+                    prx0 = pry0 = prx1 = pry1 = -1;
+                    sb_dirty = false;
+                }
+
+                /* caret blink: tiny repaint of just the caret cell */
+                if (caret_dirty) {
+                    add_rect(carect[0], carect[1], carect[2], carect[3]);
+                    caret_dirty = false;
                 }
 
                 /* About panel (repaint fully on open/close) */
